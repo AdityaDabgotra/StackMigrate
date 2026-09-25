@@ -1,3 +1,14 @@
+"""
+Step 1 validation tests. These aren't testing business logic (there
+isn't any yet) — they're proving the schema itself is sound before we
+build nodes on top of it:
+
+  1. Pydantic models validate real-shaped data and reject bad data.
+  2. The custom task-list reducer merges by id instead of duplicating.
+  3. The additive reducers behave the way the parallel editor fanout
+     will depend on (each branch's single-item list gets concatenated).
+"""
+
 import operator
 
 import pytest
