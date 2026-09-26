@@ -60,6 +60,11 @@ class MigrationRunConfig(TypedDict):
     scope_description: str     # e.g. "migrate the OrderController module only" — enforces the strangler-fig scope
     github_target_repo: str | None
     require_human_approval_before_pr: bool
+    local_checkout_path: str   # where source_repo_url has already been cloned to on disk.
+                                # Populated by a repo-fetch step that runs before this graph is
+                                # invoked (folded into the Sandbox layer in Step 3). Comprehension
+                                # reads from here rather than cloning itself, keeping the node
+                                # free of git/network concerns.
 
 
 class GraphState(TypedDict, total=False):
