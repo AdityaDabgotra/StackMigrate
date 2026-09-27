@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from app.adapters.fastapi_target.test_adapter import FastAPITargetAdapter
+from app.adapters.fast_api_target.test_adapter import FastAPITargetAdapter
 from app.adapters.target_test_base import TargetTestAdapter
 
 TARGET_TEST_ADAPTERS: dict[str, TargetTestAdapter] = {
