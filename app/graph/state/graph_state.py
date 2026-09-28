@@ -62,9 +62,12 @@ class MigrationRunConfig(TypedDict):
     require_human_approval_before_pr: bool
     local_checkout_path: str   # where source_repo_url has already been cloned to on disk.
                                 # Populated by a repo-fetch step that runs before this graph is
-                                # invoked (folded into the Sandbox layer in Step 3). Comprehension
-                                # reads from here rather than cloning itself, keeping the node
-                                # free of git/network concerns.
+                                # invoked. Comprehension reads from here rather than cloning
+                                # itself, keeping the node free of git/network concerns.
+    target_workspace_path: str # working directory containing a skeleton/checkout of the TARGET
+                                # stack project (e.g. an existing FastAPI app the migrated code
+                                # gets written into). Editor diffs are applied here before the
+                                # Sandbox runs the test suite against it.
 
 
 class GraphState(TypedDict, total=False):
@@ -84,6 +87,21 @@ class GraphState(TypedDict, total=False):
     editor_results: Annotated[list[EditorResult], operator.add]
     test_results: Annotated[list[TestResult], operator.add]
     error_analyses: Annotated[list[ErrorAnalysis], operator.add]
+
+    # ---- per-task input to a single editor branch (Send() arg only; not meaningful outside one branch) ----
+    current_task: MigrationTask | None
+
+    # ---- budget accounting for the parallel fanout ----
+    # Editor branches never mutate `budget` directly — under Send()-based
+    # fanout, state may be copied/serialized per branch, so an in-place
+    # mutation on one branch's copy could be silently lost when another
+    # branch's update is merged afterward. Instead each branch appends its
+    # LLM call cost here (safe under any serialization, since it's a plain
+    # additive reducer), and a dedicated single-writer `budget_reconcile`
+    # node folds only the NOT-YET-CONSUMED entries into `budget` afterward.
+    # See app/graph/nodes/budget_reconcile.py for the consume-index logic.
+    budget_deltas: Annotated[list[float], operator.add]
+    budget_deltas_consumed: int
 
     # ---- aggregation output (single-writer) ----
     aggregated_diff_paths: list[str]

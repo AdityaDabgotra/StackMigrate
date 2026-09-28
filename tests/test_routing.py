@@ -2,8 +2,15 @@ from __future__ import annotations
 
 from langgraph.types import Send
 
-from app.graph.routing import NO_READY_TASKS, get_ready_tasks, route_to_editors
-from app.graph.state import BudgetState, MigrationTask, TargetFileSpec, TaskStatus
+from app.graph.routing import (
+    NO_READY_TASKS,
+    SANDBOX_NEEDS_ANALYSIS,
+    SANDBOX_PASSED,
+    get_ready_tasks,
+    route_after_sandbox,
+    route_to_editors,
+)
+from app.graph.state import BudgetState, MigrationTask, TargetFileSpec, TaskStatus, TestOutcome, TestResult
 
 
 def _task(id_: str, status: TaskStatus = TaskStatus.PENDING, depends_on=None, **kw) -> MigrationTask:
@@ -74,3 +81,22 @@ def test_route_to_editors_returns_send_per_ready_task_with_correct_payload():
         assert s.arg["config"] == {"k": "v"}
         assert s.arg["comprehension"] == "IR"
         assert s.arg["budget"] is budget
+
+
+def test_route_after_sandbox_passed():
+    state = {"full_suite_result": TestResult(outcome=TestOutcome.PASSED, raw_output="ok")}
+    assert route_after_sandbox(state) == SANDBOX_PASSED
+
+
+def test_route_after_sandbox_failed():
+    state = {"full_suite_result": TestResult(outcome=TestOutcome.FAILED, raw_output="boom")}
+    assert route_after_sandbox(state) == SANDBOX_NEEDS_ANALYSIS
+
+
+def test_route_after_sandbox_error_outcome_also_routes_to_analysis():
+    state = {"full_suite_result": TestResult(outcome=TestOutcome.ERROR, raw_output="import error")}
+    assert route_after_sandbox(state) == SANDBOX_NEEDS_ANALYSIS
+
+
+def test_route_after_sandbox_no_result_routes_to_analysis_not_treated_as_pass():
+    assert route_after_sandbox({}) == SANDBOX_NEEDS_ANALYSIS

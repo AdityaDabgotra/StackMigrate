@@ -56,3 +56,4 @@ class MigrationPhase(str, Enum):
     DONE = "done"
     FAILED = "failed"
     ABORTED_BUDGET = "aborted_budget"
+    NEEDS_HUMAN = "needs_human"  # run stopped itself and is waiting on a person — not necessarily a hard failure

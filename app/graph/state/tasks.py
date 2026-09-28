@@ -6,7 +6,7 @@ fanout (LangGraph `Send()`) operates on — one task per Send.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 
 from pydantic import BaseModel, Field
 
@@ -50,7 +50,7 @@ class EditorResult(BaseModel):
     diffs: list[FileDiff]
     editor_notes: str = Field(default="", description="Assumptions or caveats the editor agent wants surfaced")
     tokens_used: int = 0
-    produced_at: datetime = Field(default_factory=datetime.utcnow)
+    produced_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 class TestResult(BaseModel):

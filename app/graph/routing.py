@@ -22,9 +22,11 @@ from __future__ import annotations
 
 from langgraph.types import Send
 
-from app.graph.state import MigrationTask, TaskStatus
+from app.graph.state import MigrationTask, TaskStatus, TestOutcome
 
 NO_READY_TASKS = "no_ready_tasks"
+SANDBOX_PASSED = "sandbox_passed"
+SANDBOX_NEEDS_ANALYSIS = "sandbox_needs_analysis"
 
 
 def get_ready_tasks(tasks: list[MigrationTask]) -> list[MigrationTask]:
@@ -65,3 +67,17 @@ def route_to_editors(state: dict) -> list[Send] | str:
         )
         for task in ready
     ]
+
+
+def route_after_sandbox(state: dict) -> str:
+    """
+    Routes on `full_suite_result.outcome`, not on `phase` — the sandbox
+    node's phase field is informational, this is the actual control
+    signal. `None` (sandbox never ran, e.g. zero diffs were available)
+    routes to analysis rather than treating it as a pass, since "no
+    result" is never the same as "passed."
+    """
+    result = state.get("full_suite_result")
+    if result is not None and result.outcome == TestOutcome.PASSED:
+        return SANDBOX_PASSED
+    return SANDBOX_NEEDS_ANALYSIS

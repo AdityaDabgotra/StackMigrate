@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from app.adapters.fast_api_target.test_adapter import FastAPITargetAdapter
+from app.adapters.fastapi_target.test_adapter import FastAPITargetAdapter
 from app.graph.state import TestOutcome
 
 ADAPTER = FastAPITargetAdapter()
