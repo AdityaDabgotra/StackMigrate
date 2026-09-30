@@ -5,6 +5,7 @@ is the contract; submodule layout can change freely underneath it.
 """
 
 from app.graph.state.budget import BudgetState
+from app.graph.state.pr import PRDraft
 from app.graph.state.enums import (
     MigrationPhase,
     SemanticUnitKind,
@@ -43,6 +44,7 @@ __all__ = [
     "ComprehensionResult",
     "DataModelUnit",
     "EndpointUnit",
+    "PRDraft",
     "FieldSpec",
     "MiddlewareUnit",
     "ParameterSpec",
