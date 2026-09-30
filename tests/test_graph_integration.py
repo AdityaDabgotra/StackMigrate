@@ -59,7 +59,13 @@ class FakeCodeGenerator:
 
     async def generate(self, prompt: str) -> EditorResponse:
         self.calls.append(prompt)
-        paths = re.findall(r"^- (\S+):", prompt, re.MULTILINE)
+        # Only scan the "Target file(s) to produce:" block, not the whole
+        # prompt — `synthesis_instructions` embeds IR unit ids containing a
+        # literal "::" (e.g. "repository::order_repository"), which a
+        # whole-prompt regex can misparse as a bogus extra path.
+        section = prompt.split("Target file(s) to produce:\n", 1)[1]
+        section = section.split("\nInstructions:", 1)[0]
+        paths = re.findall(r"^- (\S+):", section, re.MULTILINE)
         files = [FileDiff(path=p, content=f"# generated for {p}\n") for p in paths]
 
         return EditorResponse(
@@ -68,7 +74,6 @@ class FakeCodeGenerator:
             input_tokens=600,
             output_tokens=300,
         )
-
 
 class FakeSandboxRunner:
     """
