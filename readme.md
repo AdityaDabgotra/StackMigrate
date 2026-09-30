@@ -18,7 +18,7 @@ The pipeline is split into two phases that never share code paths:
   instead of needing one bespoke pipeline per stack pair — see
   `app/graph/state/ir.py` for the full schema and rationale.
 
-## Status: Step 5 of 10 — Test runner + error-analyzer retry loop
+## Status: Step 6 of 10 — Diff aggregation + GitHub PR generation
 
 **Done:**
 - Project structure (`app/core`, `app/graph`, `app/adapters`, `app/db`)
@@ -197,13 +197,83 @@ self-correcting, not just a linear pipeline:**
   own phase the way Step 4's shorter graph did — an improvement in
   behavior, not a regression papered over.
 
+**Also done in this step — plus three integrity fixes to earlier steps
+that only surfaced once "what exactly ships in the PR?" was asked in
+earnest:**
+- **Fix 1 — superseded attempts.** `editor_results` is append-only, so
+  after a retry it holds multiple attempts for the same task. Both the
+  sandbox and the PR now derive their file set from ONE shared module,
+  `app/graph/diffs.py` (`effective_diffs` / `effective_results` /
+  `stale_paths`) — latest attempt per `SUCCEEDED` task, nothing else.
+  Before this fix, the sandbox and a future PR step could each compute
+  "the files" independently and silently disagree. `stale_paths` also
+  feeds a new `remove_paths` (`app/sandbox/workspace.py`) so a retry
+  that stops emitting a helper file doesn't leave a stale copy the
+  tests still see.
+- **Fix 2 — undeclared output paths.** The editor node now enforces a
+  file contract: generated output must be exactly the task's declared
+  `target_files`, no more, no fewer (`app/graph/nodes/editor.py`
+  `_contract_violation`). Without this, nothing stopped an editor from
+  quietly rewriting the target repo's own test files to make a suite
+  "pass." A violation is treated like a failed generation — retried
+  with the violation itself as feedback, not silently accepted.
+  **This caught a real bug in the test fixtures while building it**:
+  the integration tests' fake code generator was parsing target file
+  paths out of the *entire* prompt instead of just the file-list
+  section, and picked up a spurious path from `::`-delimited IR unit
+  ids embedded in the instructions text. The new contract check
+  rejected that bogus output exactly as designed — proof the check
+  does real work, not just a rubber stamp.
+- **Fix 3 — the retry loop now actually uses its own analysis.**
+  `ErrorAnalysis.suggested_fix_instructions` was computed since Step 5
+  but never fed anywhere. Added `MigrationTask.retry_feedback`, set by
+  `error_analysis` and read by the editor's retry prompt — a retry is
+  now a directed fix attempt, not a second blind guess.
+- **`app/graph/nodes/aggregate.py`** — builds the PR title/body/branch
+  name deterministically (no LLM call — a structured, factual summary
+  doesn't need one, and a template avoids a flaky source of variance in
+  a step whose output is about to enter a real repository) from the
+  effective diffs, and re-validates every path with
+  `app/vcs/paths.py`'s `publishable_path_problem` as defense-in-depth
+  even though the editor contract should already prevent a bad path
+  from arriving here. `.github/` is explicitly refused — a generated
+  CI workflow in a PR is a privilege-escalation vector (workflows can
+  run with repository secrets), and no application-code migration has
+  a legitimate reason to touch it. A violation here is a hard stop,
+  never a silent drop.
+- **`app/vcs/github_publisher.py`** — real PyGithub-backed publisher:
+  builds a git tree/commit/branch/PR the standard way (there's no
+  "upload several files" REST endpoint). Lazy-imports `PyGithub`, same
+  pattern as every other external SDK in this project.
+- **Approval gating** (`app/graph/nodes/pr_publish.py`) — honors
+  `require_human_approval_before_pr` (present in the schema since
+  Step 1, unused until now): stops at `AWAITING_APPROVAL` with the
+  draft ready to inspect, without calling the publisher. The real
+  pause/resume (`interrupt()`) is explicitly Step 9's job; for now this
+  is a clean terminal state, and `publish_approved_pr` is a standalone
+  function (not inlined in the node) specifically so a future caller —
+  the Step 7 API layer, once a human approves — reuses the exact same
+  publish path this node itself takes when approval isn't required,
+  rather than a second implementation that could drift from it.
+- **A bug caught by reasoning through the wiring before running
+  anything**: the fixed `aggregate -> pr_publish` edge always runs
+  `pr_publish`, but `aggregate` can fail (empty diffs, unpublishable
+  path) without producing a `pr_draft` — which would have crashed
+  `pr_publish` on a missing key. Fixed with an explicit guard that
+  leaves `aggregate`'s own `FAILED` state untouched instead.
+- **32 new tests (105 total)**, including two new full-graph
+  integration tests: one proves a PR is actually published (via a fake
+  publisher) with exactly the effective diffs and nothing else, the
+  other proves the approval gate actually stops the run — publisher
+  never called — while still leaving a ready draft behind.
+
 **Not yet built (upcoming steps):**
 1. ~~Scaffolding + state schema~~ ✅
 2. ~~Comprehension node (repo analysis → IR)~~ ✅
 3. ~~Sandbox execution layer (Docker isolation)~~ ✅
 4. ~~Synthesis + editor nodes with parallel `Send()` fanout~~ ✅
 5. ~~Test runner + error-analyzer retry loop~~ ✅
-6. Diff aggregation + GitHub PR generation
+6. ~~Diff aggregation + GitHub PR generation~~ ✅
 7. FastAPI + Celery async API layer
 8. Budget guard + observability wiring
 9. Human-in-the-loop approval via `interrupt()`
