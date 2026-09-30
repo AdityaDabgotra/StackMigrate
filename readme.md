@@ -18,7 +18,7 @@ The pipeline is split into two phases that never share code paths:
   instead of needing one bespoke pipeline per stack pair — see
   `app/graph/state/ir.py` for the full schema and rationale.
 
-## Status: Step 6 of 10 — Diff aggregation + GitHub PR generation
+## Status: Step 7 of 10 — FastAPI + Celery async API layer
 
 **Done:**
 - Project structure (`app/core`, `app/graph`, `app/adapters`, `app/db`)
@@ -267,6 +267,65 @@ earnest:**
   other proves the approval gate actually stops the run — publisher
   never called — while still leaving a ready draft behind.
 
+**Also done in this step:**
+- **`app/services/repo_prep.py`** — turns request URLs into the two
+  local paths every node since Step 2 assumed already existed
+  (`local_checkout_path`/`target_workspace_path`). Real git clones via
+  GitPython (lazy-imported), or a scaffolded fresh FastAPI skeleton
+  when no target repo is given. **Tested with a real network clone**
+  against a tiny public repo (`tests/test_repo_prep.py`) — deliberately
+  not faked, since the whole point of this module is "did we get the
+  real clone semantics right," which a mock can't verify.
+- **No separate "runs" database.** Status and approval read/write
+  through the compiled graph's own `aget_state`/`aupdate_state` against
+  its existing checkpointer — LangGraph's checkpoint store already IS
+  the durable, queryable record of every run; a second store would just
+  be a second source of truth that could drift from the first.
+- **`app/api/app.py`** — `create_app()` factory with three routes:
+  `POST /migrations` (submit, hands off via a `TaskSubmitter` Protocol —
+  Celery in production, a recording fake in tests), `GET /migrations/{id}`
+  (404 if the thread never existed — verified via LangGraph's actual
+  behavior for an unknown `thread_id`, not assumed), `POST
+  /migrations/{id}/approve` (404 if unknown, 409 if not
+  `AWAITING_APPROVAL` or no draft, otherwise calls Step 6's
+  `publish_approved_pr` — reused, not reimplemented — then
+  `aupdate_state` to persist the result).
+- **`app/worker/tasks.py`** — the real Celery task: repo prep, real
+  graph, real Postgres checkpointer, one run per LangGraph thread
+  (`thread_id == run_id`).
+- **A genuine architectural bug caught before it could break in
+  production**: the first draft of `app/main.py` built the Postgres
+  checkpointer's connection pool at module-import time, on a throwaway
+  event loop — before uvicorn's real loop exists. Async DB drivers bind
+  connections to the loop that created them, so the pool would have
+  been silently unusable the moment a real request hit it under
+  uvicorn. Fixed by moving construction into a FastAPI `lifespan`
+  handler (runs inside the server's actual loop) and having routes read
+  `request.app.state.graph` instead of closing over a fixed variable —
+  the right idiomatic pattern, not a workaround.
+- **A second real bug, caught immediately by just trying to run the
+  new tests**: `app/db/checkpointer.py` (written in Step 1) imported
+  `AsyncPostgresSaver` at module level — meaning anything importing
+  `app.db.checkpointer` at all required the Postgres extra installed,
+  even code that never calls `get_checkpointer()`. Every other external
+  SDK in this project was already lazy-imported for exactly this
+  reason; this one had been missed. Fixed the same way.
+- **Stated gap, not glossed over**: this environment has no Postgres to
+  test against, so `AsyncPostgresSaver`'s round-trip of our custom
+  Pydantic model fields (`BudgetState`, `MigrationTask`, etc.) through
+  real serialization is unverified here — tests use LangGraph's
+  in-memory `MemorySaver`, which round-trips Python objects directly
+  with no serialization step at all. `app/api/app.py`'s status mapper
+  defends against the round-trip producing plain dicts instead of the
+  original objects, but this should be smoke-tested against a real
+  Postgres instance before relying on it in production.
+- **15 new tests (120 total)**: 5 for repo prep (including the real
+  clone), 3 for the worker's orchestration (fakes throughout, in-memory
+  checkpointer), 7 for the full API surface — including proving that
+  `POST /approve` actually persists (a follow-up `GET` sees the
+  published PR URL, not just the response body of the approve call
+  itself).
+
 **Not yet built (upcoming steps):**
 1. ~~Scaffolding + state schema~~ ✅
 2. ~~Comprehension node (repo analysis → IR)~~ ✅
@@ -274,7 +333,7 @@ earnest:**
 4. ~~Synthesis + editor nodes with parallel `Send()` fanout~~ ✅
 5. ~~Test runner + error-analyzer retry loop~~ ✅
 6. ~~Diff aggregation + GitHub PR generation~~ ✅
-7. FastAPI + Celery async API layer
+7. ~~FastAPI + Celery async API layer~~ ✅
 8. Budget guard + observability wiring
 9. Human-in-the-loop approval via `interrupt()`
 10. Deployment (Dockerfile, docker-compose, CI)
@@ -286,13 +345,17 @@ pip install -r requirements.txt
 PYTHONPATH=. pytest tests/ -v
 ```
 
-Note: `app/core/llm.py`'s real `ExtractionClient` and
-`app/sandbox/docker_runner.py`'s real `DockerSandboxRunner` both import
-their respective SDKs (`langchain_anthropic`, `docker`) lazily, inside
-method bodies — so the full test suite above runs with zero API key,
-zero Docker daemon, and zero network access. Only actually invoking a
-real comprehension run or a real sandbox run requires those to be
-present.
+Note: `app/core/llm.py`'s real `ExtractionClient`,
+`app/sandbox/docker_runner.py`'s real `DockerSandboxRunner`,
+`app/vcs/github_publisher.py`'s real `GitHubPRPublisher`, and
+`app/db/checkpointer.py`'s `get_checkpointer()` all import their
+respective SDKs (`langchain_anthropic`, `docker`, `github`,
+`langgraph.checkpoint.postgres`) lazily, inside method/function bodies
+— so the full test suite runs with zero API key, zero Docker daemon,
+zero GitHub token, and zero Postgres instance. The one exception is
+`tests/test_repo_prep.py`, which does real (tiny, shallow) `git clone`
+calls against a public GitHub repo — everything else is either a pure
+function or exercised through a fake.
 
 ## Why a TypedDict for `GraphState` and not pure Pydantic?
 
