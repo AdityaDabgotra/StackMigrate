@@ -11,7 +11,7 @@ def _draft() -> PRDraft:
     return PRDraft(
         title="Migrate orders",
         body="body",
-        branch_name="StackMigrate/run-1",
+        branch_name="stackmigrate/run-1",
         commit_message="StackMigrate: migrate orders",
     )
 
