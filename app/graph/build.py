@@ -110,6 +110,9 @@ def build_graph(
     # scheduling above. If nothing came out retryable (everything escalated
     # to NEEDS_HUMAN, or nothing was attributable), the run ends here.
     graph.add_conditional_edges("error_analysis", route_to_editors, {NO_READY_TASKS: END})
+    
+    graph.add_edge("aggregate", "pr_publish")
+    graph.add_edge("pr_publish", END)
 
     return graph.compile(checkpointer=checkpointer)
 
