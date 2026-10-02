@@ -34,6 +34,7 @@ from app.graph.state.budget import BudgetState
 from app.graph.state.enums import MigrationPhase
 from app.graph.state.ir import ComprehensionResult
 from app.graph.state.tasks import ErrorAnalysis, EditorResult, MigrationTask, TestResult
+from app.graph.state.pr import PRDraft
 
 
 def _merge_task_lists(existing: list[MigrationTask], new: list[MigrationTask]) -> list[MigrationTask]:
@@ -108,6 +109,7 @@ class GraphState(TypedDict, total=False):
     full_suite_result: TestResult | None
 
     # ---- PR output (single-writer) ----
+    pr_draft: PRDraft | None
     pr_url: str | None
     pr_branch_name: str | None
 

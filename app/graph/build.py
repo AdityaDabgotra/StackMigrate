@@ -39,6 +39,8 @@ from __future__ import annotations
 from langgraph.graph import END, START, StateGraph
 
 from app.core.llm import ExtractionClient
+from app.graph.nodes.aggregate import build_aggregate_node
+from app.graph.nodes.pr_publish import build_pr_publish_node
 from app.graph.nodes.budget_reconcile import build_budget_reconcile_node
 from app.graph.nodes.comprehension import Extractor, build_comprehension_node
 from app.graph.nodes.editor import CodeGenerator, build_editor_node
@@ -55,6 +57,7 @@ from app.graph.routing import (
 from app.graph.state import GraphState
 from app.sandbox.docker_runner import DockerSandboxRunner
 from app.sandbox.interface import SandboxRunner
+from app.vcs.github_publisher import GitHubPRPublisher
 
 
 def build_graph(
@@ -63,6 +66,7 @@ def build_graph(
     code_generator: CodeGenerator | None = None,
     error_analyzer: ErrorAnalyzer | None = None,
     sandbox_runner: SandboxRunner | None = None,
+    pr_publisher: GitHubPRPublisher | None = None,
     checkpointer=None,
 ):
     """
@@ -79,6 +83,7 @@ def build_graph(
     code_generator = code_generator or _default_code_generator()
     error_analyzer = error_analyzer or _default_error_analyzer()
     sandbox_runner = sandbox_runner or DockerSandboxRunner()
+    pr_publisher = pr_publisher or _default_pr_publisher()
 
     graph = StateGraph(GraphState)
     graph.add_node("comprehension", build_comprehension_node(extractor))
@@ -87,6 +92,8 @@ def build_graph(
     graph.add_node("budget_reconcile", build_budget_reconcile_node())
     graph.add_node("sandbox_test", build_sandbox_test_node(sandbox_runner))
     graph.add_node("error_analysis", build_error_analysis_node(error_analyzer))
+    graph.add_node("aggregate", build_aggregate_node())
+    graph.add_node("pr_publish", build_pr_publish_node(pr_publisher))
 
     graph.add_edge(START, "comprehension")
     graph.add_edge("comprehension", "synthesis")
@@ -102,7 +109,9 @@ def build_graph(
     graph.add_conditional_edges("budget_reconcile", route_to_editors, {NO_READY_TASKS: "sandbox_test"})
 
     graph.add_conditional_edges(
-        "sandbox_test", route_after_sandbox, {SANDBOX_PASSED: END, SANDBOX_NEEDS_ANALYSIS: "error_analysis"}
+        "sandbox_test",
+        route_after_sandbox,
+        {SANDBOX_PASSED: "aggregate", SANDBOX_NEEDS_ANALYSIS: "error_analysis"},
     )
 
     # The retry loop: error_analysis marks retryable tasks RETRYING, then
@@ -110,12 +119,17 @@ def build_graph(
     # scheduling above. If nothing came out retryable (everything escalated
     # to NEEDS_HUMAN, or nothing was attributable), the run ends here.
     graph.add_conditional_edges("error_analysis", route_to_editors, {NO_READY_TASKS: END})
-    
+
     graph.add_edge("aggregate", "pr_publish")
     graph.add_edge("pr_publish", END)
 
     return graph.compile(checkpointer=checkpointer)
 
+
+def _default_pr_publisher():
+    from app.vcs.github_publisher import GitHubPRPublisher
+
+    return GitHubPRPublisher()
 
 def _default_code_generator():
     from app.core.llm import EditorClient

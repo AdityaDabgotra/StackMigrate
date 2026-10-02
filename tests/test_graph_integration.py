@@ -47,6 +47,7 @@ from app.graph.state import (
 )
 from app.sandbox.interface import SandboxRunResult
 from tests.test_comprehension_node import FakeExtractor, _write_spring_repo
+from tests.test_pr_publish_node import FakePublisher
 
 
 class FakeCodeGenerator:
@@ -186,7 +187,8 @@ async def test_full_pipeline_comprehension_through_sandbox():
         # --- sandbox ran once, against ALL THREE migrated files on disk ---
         assert len(sandbox_runner.calls) == 1
         assert final_state["full_suite_result"].outcome == TestOutcome.PASSED
-        assert final_state["phase"] == MigrationPhase.AGGREGATING  # set by sandbox_test itself; graph -> END on pass
+        assert final_state["phase"] == MigrationPhase.DONE
+        assert final_state["pr_draft"] is not None
 
         for task in tasks:
             path = task.target_files[0].path
@@ -308,3 +310,50 @@ async def test_round_cap_terminates_a_perpetually_failing_run_instead_of_looping
         assert final_state["retry_round"] == 2  # stopped exactly at the cap
         assert len(sandbox_runner.calls) == 2  # exactly 2 full-suite attempts — not 3, not infinite
         assert all(t.status == TaskStatus.NEEDS_HUMAN for t in final_state["tasks"])
+
+
+@pytest.mark.asyncio
+async def test_approval_required_stops_graph_before_publishing():
+    with tempfile.TemporaryDirectory() as source_root, tempfile.TemporaryDirectory() as target_root:
+        _write_spring_repo(source_root)
+        publisher = FakePublisher()
+        graph = build_graph(
+            extractor=FakeExtractor(),
+            code_generator=FakeCodeGenerator(),
+            sandbox_runner=FakeSandboxRunner(outcome=TestOutcome.PASSED),
+            pr_publisher=publisher,
+        )
+        config = _base_config(source_root, target_root)
+        config["github_target_repo"] = "acme/orders-api"
+        config["require_human_approval_before_pr"] = True
+
+        final_state = await graph.ainvoke({"config": config, "budget": BudgetState(max_usd=10.0)})
+
+        assert final_state["phase"] == MigrationPhase.AWAITING_APPROVAL
+        assert final_state["pr_draft"] is not None
+        assert publisher.calls == []  # the gate actually held
+
+
+@pytest.mark.asyncio
+async def test_publishes_pr_with_exactly_the_effective_diffs_when_approval_not_required():
+    with tempfile.TemporaryDirectory() as source_root, tempfile.TemporaryDirectory() as target_root:
+        _write_spring_repo(source_root)
+        publisher = FakePublisher()
+        graph = build_graph(
+            extractor=FakeExtractor(),
+            code_generator=FakeCodeGenerator(),
+            sandbox_runner=FakeSandboxRunner(outcome=TestOutcome.PASSED),
+            pr_publisher=publisher,
+        )
+        config = _base_config(source_root, target_root)
+        config["github_target_repo"] = "acme/orders-api"
+        config["require_human_approval_before_pr"] = False
+
+        final_state = await graph.ainvoke({"config": config, "budget": BudgetState(max_usd=10.0)})
+
+        assert final_state["phase"] == MigrationPhase.DONE
+        assert final_state["pr_url"] == "https://github.com/acme/orders-api/pull/42"
+        assert len(publisher.calls) == 1
+        published = sorted(f.path for f in publisher.calls[0]["files"])
+        expected = sorted(t.target_files[0].path for t in final_state["tasks"])
+        assert published == expected
