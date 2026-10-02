@@ -24,6 +24,7 @@ from fastapi import FastAPI
 
 from app.api.app import create_app
 from app.api.task_submitter import CeleryTaskSubmitter
+from app.core.observability import configure_logging
 from app.db.checkpointer import get_checkpointer
 from app.graph.build import build_graph
 from app.vcs.github_publisher import GitHubPRPublisher
@@ -31,6 +32,7 @@ from app.vcs.github_publisher import GitHubPRPublisher
 
 @asynccontextmanager
 async def lifespan(fastapi_app: FastAPI):
+    configure_logging()
     async with get_checkpointer() as checkpointer:
         await checkpointer.setup()  # idempotent; cheap enough to call on every boot
         fastapi_app.state.graph = build_graph(checkpointer=checkpointer)

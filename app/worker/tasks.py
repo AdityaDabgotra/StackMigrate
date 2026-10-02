@@ -15,6 +15,7 @@ without needing a running Celery worker/broker.
 from __future__ import annotations
 
 from app.api.schemas import MigrationRequest
+from app.core.observability import run_config
 from app.db.checkpointer import get_checkpointer
 from app.graph.build import build_graph
 from app.graph.state import BudgetState
@@ -72,15 +73,28 @@ async def _run_migration_async(
         graph = build_graph(checkpointer=checkpointer, **graph_kwargs)
         initial_state = {
             "config": config,
-            "budget": BudgetState(max_usd=request.max_usd),
+            "budget": BudgetState(
+                max_usd=request.max_usd,
+                max_llm_calls=request.max_llm_calls,
+                max_wall_clock_seconds=request.max_wall_clock_seconds,
+            ),
             "max_retry_rounds": request.max_retry_rounds,
         }
-        return await graph.ainvoke(initial_state, config={"configurable": {"thread_id": run_id}})
+        return await graph.ainvoke(
+            initial_state,
+            config=run_config(
+                run_id, source_stack=request.source_stack, target_stack=request.target_stack, max_usd=request.max_usd
+            ),
+        )
 
 
 @celery_app.task(name="stackmigrate.run_migration")
 def run_migration(run_id: str, request_payload: dict) -> None:
     import asyncio
+
+    from app.core.observability import configure_logging
+
+    configure_logging()
 
     request = MigrationRequest(**request_payload)
     asyncio.run(_run_migration_async(run_id, request))

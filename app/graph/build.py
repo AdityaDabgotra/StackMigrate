@@ -39,8 +39,10 @@ from __future__ import annotations
 from langgraph.graph import END, START, StateGraph
 
 from app.core.llm import ExtractionClient
+from app.core.observability import observed_node
 from app.graph.nodes.aggregate import build_aggregate_node
 from app.graph.nodes.pr_publish import build_pr_publish_node
+from app.graph.nodes.budget_abort import build_budget_abort_node
 from app.graph.nodes.budget_reconcile import build_budget_reconcile_node
 from app.graph.nodes.comprehension import Extractor, build_comprehension_node
 from app.graph.nodes.editor import CodeGenerator, build_editor_node
@@ -48,9 +50,12 @@ from app.graph.nodes.error_analysis import ErrorAnalyzer, build_error_analysis_n
 from app.graph.nodes.sandbox_test import build_sandbox_test_node
 from app.graph.nodes.synthesis import build_synthesis_node
 from app.graph.routing import (
+    BUDGET_EXHAUSTED,
+    CONTINUE,
     NO_READY_TASKS,
     SANDBOX_NEEDS_ANALYSIS,
     SANDBOX_PASSED,
+    route_after_comprehension,
     route_after_sandbox,
     route_to_editors,
 )
@@ -86,27 +91,34 @@ def build_graph(
     pr_publisher = pr_publisher or _default_pr_publisher()
 
     graph = StateGraph(GraphState)
-    graph.add_node("comprehension", build_comprehension_node(extractor))
-    graph.add_node("synthesis", build_synthesis_node())
-    graph.add_node("editor", build_editor_node(code_generator))
-    graph.add_node("budget_reconcile", build_budget_reconcile_node())
-    graph.add_node("sandbox_test", build_sandbox_test_node(sandbox_runner))
-    graph.add_node("error_analysis", build_error_analysis_node(error_analyzer))
-    graph.add_node("aggregate", build_aggregate_node())
-    graph.add_node("pr_publish", build_pr_publish_node(pr_publisher))
+    graph.add_node("comprehension", observed_node("comprehension", build_comprehension_node(extractor)))
+    graph.add_node("synthesis", observed_node("synthesis", build_synthesis_node()))
+    graph.add_node("editor", observed_node("editor", build_editor_node(code_generator)))
+    graph.add_node("budget_reconcile", observed_node("budget_reconcile", build_budget_reconcile_node()))
+    graph.add_node("sandbox_test", observed_node("sandbox_test", build_sandbox_test_node(sandbox_runner)))
+    graph.add_node("error_analysis", observed_node("error_analysis", build_error_analysis_node(error_analyzer)))
+    graph.add_node("aggregate", observed_node("aggregate", build_aggregate_node()))
+    graph.add_node("pr_publish", observed_node("pr_publish", build_pr_publish_node(pr_publisher)))
+    graph.add_node("budget_abort", observed_node("budget_abort", build_budget_abort_node()))
 
     graph.add_edge(START, "comprehension")
-    graph.add_edge("comprehension", "synthesis")
+    graph.add_conditional_edges(
+        "comprehension", route_after_comprehension, {CONTINUE: "synthesis", BUDGET_EXHAUSTED: "budget_abort"}
+    )
 
     # Initial dispatch: whatever's ready with no dependencies at all.
-    graph.add_conditional_edges("synthesis", route_to_editors, {NO_READY_TASKS: "sandbox_test"})
+    graph.add_conditional_edges(
+        "synthesis", route_to_editors, {NO_READY_TASKS: "sandbox_test", BUDGET_EXHAUSTED: "budget_abort"}
+    )
 
     graph.add_edge("editor", "budget_reconcile")
 
     # The multi-wave loop: after each wave, check whether finishing it made
     # more tasks ready (a dependency just succeeded) and dispatch again;
     # once nothing's left ready, move on to actually running the tests.
-    graph.add_conditional_edges("budget_reconcile", route_to_editors, {NO_READY_TASKS: "sandbox_test"})
+    graph.add_conditional_edges(
+        "budget_reconcile", route_to_editors, {NO_READY_TASKS: "sandbox_test", BUDGET_EXHAUSTED: "budget_abort"}
+    )
 
     graph.add_conditional_edges(
         "sandbox_test",
@@ -118,10 +130,13 @@ def build_graph(
     # rejoins the exact same dispatch mechanism as the initial multi-wave
     # scheduling above. If nothing came out retryable (everything escalated
     # to NEEDS_HUMAN, or nothing was attributable), the run ends here.
-    graph.add_conditional_edges("error_analysis", route_to_editors, {NO_READY_TASKS: END})
+    graph.add_conditional_edges(
+        "error_analysis", route_to_editors, {NO_READY_TASKS: END, BUDGET_EXHAUSTED: "budget_abort"}
+    )
 
     graph.add_edge("aggregate", "pr_publish")
     graph.add_edge("pr_publish", END)
+    graph.add_edge("budget_abort", END)
 
     return graph.compile(checkpointer=checkpointer)
 

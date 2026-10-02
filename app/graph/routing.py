@@ -22,9 +22,11 @@ from __future__ import annotations
 
 from langgraph.types import Send
 
-from app.graph.state import MigrationTask, TaskStatus, TestOutcome
+from app.graph.state import MigrationPhase, MigrationTask, TaskStatus, TestOutcome
 
 NO_READY_TASKS = "no_ready_tasks"
+BUDGET_EXHAUSTED = "budget_exhausted"
+CONTINUE = "continue"
 SANDBOX_PASSED = "sandbox_passed"
 SANDBOX_NEEDS_ANALYSIS = "sandbox_needs_analysis"
 
@@ -53,7 +55,18 @@ def route_to_editors(state: dict) -> list[Send] | str:
     ready = get_ready_tasks(tasks)
 
     if not ready:
-        return NO_READY_TASKS
+        return NO_READY_TASKS  # nothing left to spend on — fine even if the budget is now exactly used up
+
+    # Central budget gate: every editor dispatch (initial, next dependency
+    # wave, retry) passes through here. Work remains but the budget can't
+    # pay for it -> abort. Otherwise cap the wave so parallel branches
+    # can't collectively overshoot the ceiling (the leftovers stay ready
+    # and are picked up by the next wave's pass through this router).
+    budget = state.get("budget")
+    if budget is not None:
+        if budget.is_exhausted():
+            return BUDGET_EXHAUSTED
+        ready = ready[: budget.affordable_calls(len(ready))]
 
     return [
         Send(
@@ -81,3 +94,8 @@ def route_after_sandbox(state: dict) -> str:
     if result is not None and result.outcome == TestOutcome.PASSED:
         return SANDBOX_PASSED
     return SANDBOX_NEEDS_ANALYSIS
+
+
+def route_after_comprehension(state: dict) -> str:
+    """A budget abort inside comprehension must end the run, not fall through to synthesis/sandbox."""
+    return BUDGET_EXHAUSTED if state.get("phase") == MigrationPhase.ABORTED_BUDGET else CONTINUE

@@ -52,16 +52,15 @@ def build_editor_node(generator: CodeGenerator):
         task: MigrationTask = state["current_task"]
         budget: BudgetState = state["budget"]
 
-        # Soft pre-check only: under concurrent fanout this can't see other
-        # in-flight branches' spend precisely (see budget_deltas comment in
-        # graph_state.py), so a small overshoot past the cap is possible in
-        # the worst case. Hardening this into a hard, exact ceiling is
-        # tracked for Step 8 (budget guard + observability).
-        if budget.remaining_usd() <= 0:
+        # Last-line defense only. The real gate is `route_to_editors`, which
+        # refuses to dispatch when the budget is exhausted and caps each wave
+        # by the largest observed call cost (see BudgetState.affordable_calls),
+        # so branches rarely reach this check with an empty budget.
+        if budget.is_exhausted():
             skipped_task = task.model_copy(update={"status": TaskStatus.SKIPPED})
             return {
                 "tasks": [skipped_task],
-                "error_log": [f"Editor skipped '{task.id}': budget already exhausted."],
+                "error_log": [f"Editor skipped '{task.id}': budget already exhausted ({budget.exhausted_reason()})."],
             }
 
         prompt = _build_editor_prompt(task)

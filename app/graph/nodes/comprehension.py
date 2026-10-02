@@ -223,7 +223,9 @@ def build_comprehension_node(extractor: Extractor):
             extractor=extractor,
         )
 
-        budget.record_call(cost_usd=cost)
+        # track_max=False: this is the SUM of many extraction calls, not one call, so it
+        # must not inflate the per-call cost estimate used to size editor waves.
+        budget.record_call(cost_usd=cost, track_max=False)
         next_phase = MigrationPhase.SYNTHESIS_PLANNING if result.units else MigrationPhase.FAILED
 
         return {

@@ -117,7 +117,7 @@ def build_error_analysis_node(analyzer: ErrorAnalyzer, *, max_retry_rounds_defau
                 ],
             }
 
-        if budget.remaining_usd() <= 0:
+        if budget.is_exhausted():
             escalated = [t.model_copy(update={"status": TaskStatus.NEEDS_HUMAN}) for t in candidate_tasks]
             return {
                 "tasks": escalated,

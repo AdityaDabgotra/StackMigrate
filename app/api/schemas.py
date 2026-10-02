@@ -6,6 +6,8 @@ server-side by repo_prep)."""
 
 from __future__ import annotations
 
+import os
+
 from pydantic import BaseModel, Field
 
 
@@ -20,7 +22,11 @@ class MigrationRequest(BaseModel):
         default=None, description="Base checkout for the target workspace; omit to scaffold a fresh skeleton"
     )
     require_human_approval_before_pr: bool = True
-    max_usd: float = 5.0
+    max_usd: float = Field(default_factory=lambda: float(os.environ.get("DEFAULT_MAX_USD_PER_RUN", "5.00")))
+    max_llm_calls: int = Field(default_factory=lambda: int(os.environ.get("DEFAULT_MAX_LLM_CALLS_PER_RUN", "500")))
+    max_wall_clock_seconds: int = Field(
+        default_factory=lambda: int(os.environ.get("DEFAULT_MAX_WALL_CLOCK_SECONDS", "3600"))
+    )
     max_retry_rounds: int = 5
 
 
@@ -47,6 +53,9 @@ class MigrationStatusResponse(BaseModel):
     tasks: list[TaskSummary]
     budget_spent_usd: float | None
     budget_max_usd: float | None
+    budget_llm_calls_made: int | None = None
+    budget_max_llm_calls: int | None = None
+    budget_max_wall_clock_seconds: int | None = None
     full_suite_outcome: str | None
     pr_draft: PRDraftSummary | None
     pr_url: str | None
