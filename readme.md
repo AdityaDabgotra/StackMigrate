@@ -18,9 +18,47 @@ The pipeline is split into two phases that never share code paths:
   instead of needing one bespoke pipeline per stack pair — see
   `app/graph/state/ir.py` for the full schema and rationale.
 
+## Graph flow
+
+`build_graph()` in `app/graph/build.py` assembles the compiled LangGraph
+`StateGraph` (verified against `langgraph==1.2.12`):
+
+```
+START -> comprehension -> synthesis --route_to_editors--> editor (parallel Send fanout)
+                                    \__(nothing ready)__>    |
+                                                             v
+                                                    budget_reconcile
+                                                      |           \
+                                      (more tasks now ready)     (nothing left ready)
+                                                      |                 |
+                                                      |                 v
+                                                      |            sandbox_test
+                                                      |             |          \
+                                                      |          (passed)   (failed / error)
+                                                      |             |            |
+                                                      |             v            v
+                                                      |         aggregate    error_analysis
+                                                      |             |          |        \
+                                                      |             v     (something    (nothing retryable /
+                                                      |         pr_publish  retryable)    round cap hit)
+                                                      |             |          |              |
+                                                      |             v          |              v
+                                                      |            END         |             END
+                                                      \_______________________/
+                                                  (rejoins the SAME editor fanout)
+```
+
+`route_to_editors` is the conditional router on three edges (synthesis,
+`budget_reconcile`, `error_analysis`), so multi-wave dependency scheduling
+and the retry loop are one mechanism, not two.
+
 ## Status: Step 7 of 10 — FastAPI + Celery async API layer
 
-**Done:**
+114 tests pass. Every external collaborator (LLM, Docker, GitHub, Postgres)
+is exercised through a fake, so the suite needs no API key, daemon, or token.
+
+### Steps 1–2: Scaffolding, state schema, comprehension
+
 - Project structure (`app/core`, `app/graph`, `app/adapters`, `app/db`)
 - Full Pydantic state schema (`app/graph/state/`) — IR, tasks, budget,
   enums, and the top-level LangGraph state with correct reducers for
@@ -43,12 +81,9 @@ The pipeline is split into two phases that never share code paths:
   `depends_on_unit_ids` → emits a `ComprehensionResult`. Handles
   per-file extraction failures without aborting the whole run, and
   stops precisely at the budget ceiling rather than overspending.
-- **12 passing tests** across both files, using a fake LLM extractor
-  (no real API calls) to prove the orchestration logic is correct —
-  this caught and fixed a real bug during development (see below)
 
-**Bug found and fixed during this step:** the initial scope filter
-matched file names against the scope description literally, so
+**Bug found and fixed:** the initial scope filter matched file names
+against the scope description literally, so
 `"migrate the OrderController module only"` matched `OrderController.java`
 but silently excluded `OrderService.java` and `OrderRepository.java` —
 the very files a Spring "module" migration needs. Fixed by matching
@@ -57,7 +92,8 @@ directory (Spring modules are conventionally one-package-per-feature).
 The test suite caught this immediately rather than it surfacing later
 as a mysteriously incomplete migration.
 
-**Also done in this step:**
+### Step 3: Sandbox execution layer
+
 - **Target test adapter interface** (`app/adapters/target_test_base.py`)
   — mirrors `SourceAdapter` but for the *target* side: how to install
   deps and run tests for one target stack. Separate interface from
@@ -69,8 +105,7 @@ as a mysteriously incomplete migration.
   (pytest's exit code 5 "no tests collected" is treated as
   `TestOutcome.ERROR`, not `FAILED` — it almost always means the
   migrated code has an import error, a different failure mode than a
-  normal assertion failure, and Step 5's retry logic will need to tell
-  them apart).
+  normal assertion failure).
 - **Workspace diff application** (`app/sandbox/workspace.py`) — writes
   `FileDiff` objects (LLM output) to disk with path-traversal
   protection. Every diff path is treated as untrusted input; an
@@ -85,19 +120,14 @@ as a mysteriously incomplete migration.
   dependency, specifically so the actual security posture is unit-
   testable without a Docker daemon.
 - **Sandbox test node** (`app/graph/nodes/sandbox_test.py`) — applies
-  all current `editor_results` diffs to the target workspace and runs
-  the full suite; routes to `AGGREGATING` on pass, `ERROR_ANALYSIS` on
-  anything else.
-- **23 new tests** (35 total) covering diff safety, pytest output
-  parsing, container security config, and node wiring — all via fakes,
-  no Docker daemon or network needed to run the suite.
+  all current effective diffs to the target workspace and runs the full
+  suite; routes to `AGGREGATING` on pass, `ERROR_ANALYSIS` on anything
+  else.
 
-**Also done in this step — and this is the first step with a REAL
-compiled graph, not just isolated node functions:**
-- **`app/graph/build.py`** — `build_graph()` assembles an actual
-  LangGraph `StateGraph` (verified against `langgraph==1.2.12`, the
-  version installed and exercised while building this):
-  `comprehension → synthesis → (Send fanout) → editor → budget_reconcile → sandbox_test`.
+### Step 4: Synthesis, editors, and the first real compiled graph
+
+- **`app/graph/build.py`** — the first step with a REAL compiled graph,
+  not just isolated node functions.
 - **Target synthesis adapter** (`app/adapters/target_synthesis_base.py`,
   `app/adapters/fastapi_target/synthesis_adapter.py`) — third member of
   the adapter family (alongside `SourceAdapter` and `TargetTestAdapter`):
@@ -115,11 +145,8 @@ compiled graph, not just isolated node functions:**
   a soft budget pre-check.
 - **Dependency-aware fanout routing** (`app/graph/routing.py`) —
   dispatches every task whose dependencies have already `SUCCEEDED` as
-  one parallel `Send()` batch. **Documented limitation**: this is
-  single-wave — a task blocked on a same-wave sibling isn't
-  automatically re-dispatched once that sibling finishes; multi-wave
-  scheduling is explicitly folded into Step 5's retry loop rather than
-  built twice.
+  one parallel `Send()` batch. (Originally single-wave; Step 5 made it
+  multi-wave.)
 - **A real concurrency-safety design decision**: editor branches do
   NOT mutate `BudgetState` in place. Under `Send()`-based fanout,
   LangGraph may serialize/copy state per branch, so an in-place
@@ -130,28 +157,22 @@ compiled graph, not just isolated node functions:**
   the not-yet-consumed entries into the authoritative budget —
   provably correct across multiple waves via
   `tests/test_budget_reconcile_node.py`'s double-counting test.
-- **23 new tests (58 total)**, including
-  `tests/test_graph_integration.py` — runs the **actual compiled
+- **`tests/test_graph_integration.py`** — runs the **actual compiled
   graph** end-to-end (real `Send()`, real reducers, real conditional
-  edges) with fake LLM/sandbox collaborators. This is the test that
-  would catch a `Send()` payload-shape bug or a reducer
-  misconfiguration; no amount of isolated node-function testing can
-  catch a wiring bug at the graph level, only running the graph can —
-  and it passed on the first full run after one import-path fix
-  (`CodeGenerator` was defined in `editor.py`, not `llm.py` — a typo
-  `build.py` initially imported from the wrong module).
+  edges) with fake LLM/sandbox collaborators. No amount of isolated
+  node-function testing can catch a wiring bug at the graph level, only
+  running the graph can.
 
-**Also done in this step — this is where the system becomes actually
-self-correcting, not just a linear pipeline:**
-- **Resolved Step 4's documented limitation.** `budget_reconcile`'s
-  fixed edge to `sandbox_test` became a *conditional* edge that reuses
-  `route_to_editors` — so after each editor wave, the graph checks
-  whether finishing it made more tasks ready (a dependency just
-  succeeded) and dispatches again. A 3-level chain
-  (repository → service → router) now fully completes in one graph
-  run, proven by `test_full_pipeline_comprehension_through_sandbox`,
-  which now asserts all 3 tasks reach `SUCCEEDED` — Step 4's version of
-  this same test could only guarantee the one task with no dependencies.
+### Step 5: Error analysis and the retry loop
+
+The system becomes self-correcting, not just a linear pipeline.
+
+- **Multi-wave scheduling.** `budget_reconcile`'s edge to `sandbox_test`
+  is a *conditional* edge that reuses `route_to_editors` — after each
+  editor wave, the graph checks whether finishing it made more tasks
+  ready (a dependency just succeeded) and dispatches again. A 3-level
+  chain (repository → service → router) fully completes in one graph
+  run, proven by `test_full_pipeline_comprehension_through_sandbox`.
 - **Error-analysis node** (`app/graph/nodes/error_analysis.py`) — on a
   failed sandbox run, an LLM call sees the failing tests, the raw
   output, and every task whose code is actually present in that run
@@ -161,113 +182,105 @@ self-correcting, not just a linear pipeline:**
   decision per implicated task. A task it can't confidently attribute
   is left untouched rather than guessed at.
 - **The retry loop reuses the multi-wave dispatch mechanism, not a
-  second copy of it.** `route_to_editors` is now the conditional router
-  on *three* edges (synthesis, budget_reconcile, error_analysis), each
-  with its own "nothing ready" mapping. A task error-analysis marks
-  `RETRYING` becomes eligible for the exact same dispatch path a fresh
-  dependency-driven task uses — proven by
+  second copy of it.** A task error-analysis marks `RETRYING` becomes
+  eligible for the exact same dispatch path a fresh dependency-driven
+  task uses — proven by
   `test_retry_loop_recovers_after_error_analysis_marks_tasks_retryable`,
   where marking all 3 tasks retryable correctly forces a full
-  from-scratch re-migration in dependency order (each task's dependency
-  is no longer `SUCCEEDED` either, so none are immediately ready) before
-  the sandbox re-runs and passes.
+  from-scratch re-migration in dependency order before the sandbox
+  re-runs and passes.
 - **Two independent, both-tested bounds prevent an infinite loop:**
   per-task `retry_count` vs `max_retries`, and a global `retry_round`
   vs `max_retry_rounds`. `test_round_cap_terminates_a_perpetually_failing_run`
   runs a sandbox that fails forever with an analyzer that always claims
   "retry me," and asserts the graph still terminates at exactly the
-  configured round cap — not "should terminate on paper," actually
-  observed to stop.
+  configured round cap.
 - **A real bug caught by reasoning through the wiring before writing
-  any test**: if error-analysis escalates everything to `NEEDS_HUMAN`
-  (nothing retryable), the graph goes straight to `END` and
-  `budget_reconcile` never runs again — so under the Step 4-style
-  delta mechanism, the error-analysis LLM call's own cost would have
-  silently vanished from the final budget. Fixed by having
-  `error_analysis` (which, unlike editor branches, is never part of a
-  parallel fanout) reconcile its own cost directly instead of using the
-  delta indirection that parallel branches need.
-- **15 new tests (73 total)**, including two new full-graph
-  integration tests that exercise the real retry loop and the real
-  round-cap termination — not simulated, actually run through
-  `graph.ainvoke()`. One pre-existing test's expectation changed
-  correctly: a "no diffs to test" result now flows through to
-  `error_analysis` (which recognizes it has nothing to analyze and
-  escalates to `NEEDS_HUMAN`) instead of dead-ending at `sandbox_test`'s
-  own phase the way Step 4's shorter graph did — an improvement in
-  behavior, not a regression papered over.
+  any test**: if error-analysis escalates everything to `NEEDS_HUMAN`,
+  the graph goes straight to `END` and `budget_reconcile` never runs
+  again — so the error-analysis LLM call's own cost would have silently
+  vanished from the final budget. Fixed by having `error_analysis`
+  (never part of a parallel fanout) reconcile its own cost directly.
+- A "no diffs to test" result now flows through to `error_analysis`
+  (which recognizes it has nothing to analyze and escalates to
+  `NEEDS_HUMAN`) instead of dead-ending at `sandbox_test`'s own phase.
 
-**Also done in this step — plus three integrity fixes to earlier steps
-that only surfaced once "what exactly ships in the PR?" was asked in
-earnest:**
+### Step 6: Diff aggregation and GitHub PR generation
+
+Includes three integrity fixes to earlier steps that only surfaced once
+"what exactly ships in the PR?" was asked in earnest:
+
 - **Fix 1 — superseded attempts.** `editor_results` is append-only, so
   after a retry it holds multiple attempts for the same task. Both the
   sandbox and the PR now derive their file set from ONE shared module,
   `app/graph/diffs.py` (`effective_diffs` / `effective_results` /
   `stale_paths`) — latest attempt per `SUCCEEDED` task, nothing else.
-  Before this fix, the sandbox and a future PR step could each compute
-  "the files" independently and silently disagree. `stale_paths` also
-  feeds a new `remove_paths` (`app/sandbox/workspace.py`) so a retry
-  that stops emitting a helper file doesn't leave a stale copy the
-  tests still see.
-- **Fix 2 — undeclared output paths.** The editor node now enforces a
-  file contract: generated output must be exactly the task's declared
-  `target_files`, no more, no fewer (`app/graph/nodes/editor.py`
-  `_contract_violation`). Without this, nothing stopped an editor from
-  quietly rewriting the target repo's own test files to make a suite
-  "pass." A violation is treated like a failed generation — retried
-  with the violation itself as feedback, not silently accepted.
-  **This caught a real bug in the test fixtures while building it**:
-  the integration tests' fake code generator was parsing target file
+  `stale_paths` also feeds `remove_paths` (`app/sandbox/workspace.py`)
+  so a retry that stops emitting a helper file doesn't leave a stale
+  copy the tests still see.
+- **Fix 2 — undeclared output paths.** The editor node enforces a file
+  contract: generated output must be exactly the task's declared
+  `target_files`, no more, no fewer (`_contract_violation` in
+  `app/graph/nodes/editor.py`). Without this, nothing stopped an editor
+  from quietly rewriting the target repo's own test files to make a
+  suite "pass." A violation is treated like a failed generation —
+  retried with the violation itself as feedback. This caught a real bug
+  in the test fixtures: the fake code generator was parsing target file
   paths out of the *entire* prompt instead of just the file-list
-  section, and picked up a spurious path from `::`-delimited IR unit
-  ids embedded in the instructions text. The new contract check
-  rejected that bogus output exactly as designed — proof the check
-  does real work, not just a rubber stamp.
-- **Fix 3 — the retry loop now actually uses its own analysis.**
-  `ErrorAnalysis.suggested_fix_instructions` was computed since Step 5
-  but never fed anywhere. Added `MigrationTask.retry_feedback`, set by
-  `error_analysis` and read by the editor's retry prompt — a retry is
-  now a directed fix attempt, not a second blind guess.
+  section, and picked up a spurious path from `::`-delimited IR unit ids.
+- **Fix 3 — the retry loop now uses its own analysis.**
+  `ErrorAnalysis.suggested_fix_instructions` was computed but never fed
+  anywhere. Added `MigrationTask.retry_feedback`, set by `error_analysis`
+  and read by the editor's retry prompt — a retry is now a directed fix
+  attempt, not a second blind guess.
+
+New in this step:
+
 - **`app/graph/nodes/aggregate.py`** — builds the PR title/body/branch
   name deterministically (no LLM call — a structured, factual summary
   doesn't need one, and a template avoids a flaky source of variance in
   a step whose output is about to enter a real repository) from the
   effective diffs, and re-validates every path with
-  `app/vcs/paths.py`'s `publishable_path_problem` as defense-in-depth
-  even though the editor contract should already prevent a bad path
-  from arriving here. `.github/` is explicitly refused — a generated
-  CI workflow in a PR is a privilege-escalation vector (workflows can
-  run with repository secrets), and no application-code migration has
-  a legitimate reason to touch it. A violation here is a hard stop,
-  never a silent drop.
+  `app/vcs/paths.py`'s `publishable_path_problem` as defense-in-depth.
+  `.github/` is explicitly refused — a generated CI workflow in a PR is
+  a privilege-escalation vector (workflows can run with repository
+  secrets). A violation here is a hard stop, never a silent drop.
 - **`app/vcs/github_publisher.py`** — real PyGithub-backed publisher:
   builds a git tree/commit/branch/PR the standard way (there's no
   "upload several files" REST endpoint). Lazy-imports `PyGithub`, same
-  pattern as every other external SDK in this project.
+  pattern as every other external SDK in this project; constructing
+  `GitHubPRPublisher()` never touches the network or requires a token —
+  that only happens inside `publish()`.
 - **Approval gating** (`app/graph/nodes/pr_publish.py`) — honors
-  `require_human_approval_before_pr` (present in the schema since
-  Step 1, unused until now): stops at `AWAITING_APPROVAL` with the
-  draft ready to inspect, without calling the publisher. The real
-  pause/resume (`interrupt()`) is explicitly Step 9's job; for now this
-  is a clean terminal state, and `publish_approved_pr` is a standalone
-  function (not inlined in the node) specifically so a future caller —
-  the Step 7 API layer, once a human approves — reuses the exact same
-  publish path this node itself takes when approval isn't required,
-  rather than a second implementation that could drift from it.
-- **A bug caught by reasoning through the wiring before running
-  anything**: the fixed `aggregate -> pr_publish` edge always runs
-  `pr_publish`, but `aggregate` can fail (empty diffs, unpublishable
-  path) without producing a `pr_draft` — which would have crashed
-  `pr_publish` on a missing key. Fixed with an explicit guard that
-  leaves `aggregate`'s own `FAILED` state untouched instead.
-- **32 new tests (105 total)**, including two new full-graph
-  integration tests: one proves a PR is actually published (via a fake
-  publisher) with exactly the effective diffs and nothing else, the
-  other proves the approval gate actually stops the run — publisher
-  never called — while still leaving a ready draft behind.
+  `require_human_approval_before_pr`: stops at `AWAITING_APPROVAL` with
+  the draft ready to inspect, without calling the publisher. The real
+  pause/resume (`interrupt()`) is Step 9's job; for now this is a clean
+  terminal state, and `publish_approved_pr` is a standalone function so
+  the API layer reuses the exact same publish path rather than a second
+  implementation that could drift from it.
+- **A bug caught by reasoning through the wiring**: the fixed
+  `aggregate -> pr_publish` edge always runs `pr_publish`, but
+  `aggregate` can fail (empty diffs, unpublishable path) without
+  producing a `pr_draft`. Fixed with an explicit guard that leaves
+  `aggregate`'s own `FAILED` state untouched.
+- **Graph-level tests for the publish path** in
+  `tests/test_graph_integration.py`: one proves a PR is published (via
+  a fake publisher) with exactly the effective diffs and nothing else,
+  the other proves the approval gate stops the run — publisher never
+  called — while still leaving a draft behind.
 
-**Also done in this step:**
+**Bug found and fixed while wiring Step 6 into the compiled graph:**
+`aggregate` and `pr_publish` were not registered in `build_graph()`, a
+passing sandbox run still routed to `END`, and `GraphState` had no
+`pr_draft` field. The last one is the subtle failure: LangGraph silently
+discards any key a node returns that isn't declared in the state schema,
+so `aggregate`'s draft vanished with no error and `pr_publish` saw
+nothing. Node-level unit tests can't see this — only running the
+compiled graph can. **Rule of thumb: every key a node returns must be
+declared in `GraphState`.**
+
+### Step 7: FastAPI + Celery async API layer
+
 - **`app/services/repo_prep.py`** — turns request URLs into the two
   local paths every node since Step 2 assumed already existed
   (`local_checkout_path`/`target_workspace_path`). Real git clones via
@@ -284,11 +297,9 @@ earnest:**
 - **`app/api/app.py`** — `create_app()` factory with three routes:
   `POST /migrations` (submit, hands off via a `TaskSubmitter` Protocol —
   Celery in production, a recording fake in tests), `GET /migrations/{id}`
-  (404 if the thread never existed — verified via LangGraph's actual
-  behavior for an unknown `thread_id`, not assumed), `POST
-  /migrations/{id}/approve` (404 if unknown, 409 if not
-  `AWAITING_APPROVAL` or no draft, otherwise calls Step 6's
-  `publish_approved_pr` — reused, not reimplemented — then
+  (404 if the thread never existed), `POST /migrations/{id}/approve`
+  (404 if unknown, 409 if not `AWAITING_APPROVAL` or no draft, otherwise
+  calls `publish_approved_pr` — reused, not reimplemented — then
   `aupdate_state` to persist the result).
 - **`app/worker/tasks.py`** — the real Celery task: repo prep, real
   graph, real Postgres checkpointer, one run per LangGraph thread
@@ -298,35 +309,24 @@ earnest:**
   checkpointer's connection pool at module-import time, on a throwaway
   event loop — before uvicorn's real loop exists. Async DB drivers bind
   connections to the loop that created them, so the pool would have
-  been silently unusable the moment a real request hit it under
-  uvicorn. Fixed by moving construction into a FastAPI `lifespan`
-  handler (runs inside the server's actual loop) and having routes read
-  `request.app.state.graph` instead of closing over a fixed variable —
-  the right idiomatic pattern, not a workaround.
-- **A second real bug, caught immediately by just trying to run the
-  new tests**: `app/db/checkpointer.py` (written in Step 1) imported
-  `AsyncPostgresSaver` at module level — meaning anything importing
-  `app.db.checkpointer` at all required the Postgres extra installed,
-  even code that never calls `get_checkpointer()`. Every other external
-  SDK in this project was already lazy-imported for exactly this
-  reason; this one had been missed. Fixed the same way.
+  been silently unusable under uvicorn. Fixed by moving construction
+  into a FastAPI `lifespan` handler and having routes read
+  `request.app.state.graph`.
+- **A second real bug**: `app/db/checkpointer.py` imported
+  `AsyncPostgresSaver` at module level, so anything importing it
+  required the Postgres extra installed. Fixed with a lazy import, like
+  every other external SDK in this project.
 - **Stated gap, not glossed over**: this environment has no Postgres to
   test against, so `AsyncPostgresSaver`'s round-trip of our custom
   Pydantic model fields (`BudgetState`, `MigrationTask`, etc.) through
-  real serialization is unverified here — tests use LangGraph's
-  in-memory `MemorySaver`, which round-trips Python objects directly
-  with no serialization step at all. `app/api/app.py`'s status mapper
-  defends against the round-trip producing plain dicts instead of the
-  original objects, but this should be smoke-tested against a real
-  Postgres instance before relying on it in production.
-- **15 new tests (120 total)**: 5 for repo prep (including the real
-  clone), 3 for the worker's orchestration (fakes throughout, in-memory
-  checkpointer), 7 for the full API surface — including proving that
-  `POST /approve` actually persists (a follow-up `GET` sees the
-  published PR URL, not just the response body of the approve call
-  itself).
+  real serialization is unverified — tests use LangGraph's in-memory
+  `MemorySaver`. `app/api/app.py`'s status mapper defends against the
+  round-trip producing plain dicts instead of the original objects, but
+  this should be smoke-tested against a real Postgres instance before
+  relying on it in production.
 
-**Not yet built (upcoming steps):**
+## Roadmap
+
 1. ~~Scaffolding + state schema~~ ✅
 2. ~~Comprehension node (repo analysis → IR)~~ ✅
 3. ~~Sandbox execution layer (Docker isolation)~~ ✅
@@ -338,14 +338,21 @@ earnest:**
 9. Human-in-the-loop approval via `interrupt()`
 10. Deployment (Dockerfile, docker-compose, CI)
 
-## Running the current tests
+## Running the tests
 
 ```bash
 pip install -r requirements.txt
 PYTHONPATH=. pytest tests/ -v
 ```
 
-Note: `app/core/llm.py`'s real `ExtractionClient`,
+On Windows PowerShell:
+
+```powershell
+$env:PYTHONPATH = "."
+pytest tests/ -v
+```
+
+`app/core/llm.py`'s real `ExtractionClient`,
 `app/sandbox/docker_runner.py`'s real `DockerSandboxRunner`,
 `app/vcs/github_publisher.py`'s real `GitHubPRPublisher`, and
 `app/db/checkpointer.py`'s `get_checkpointer()` all import their
