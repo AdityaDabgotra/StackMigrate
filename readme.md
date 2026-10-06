@@ -21,40 +21,46 @@ The pipeline is split into two phases that never share code paths:
 ## Graph flow
 
 `build_graph()` in `app/graph/build.py` assembles the compiled LangGraph
-`StateGraph` (verified against `langgraph==1.2.12`):
+`StateGraph` (verified against `langgraph==1.2.12`). Every node is wrapped
+by `observed_node` (structured logging, see Step 8).
 
 ```
-START -> comprehension -> synthesis --route_to_editors--> editor (parallel Send fanout)
-                                    \__(nothing ready)__>    |
-                                                             v
-                                                    budget_reconcile
-                                                      |           \
-                                      (more tasks now ready)     (nothing left ready)
-                                                      |                 |
-                                                      |                 v
-                                                      |            sandbox_test
-                                                      |             |          \
-                                                      |          (passed)   (failed / error)
-                                                      |             |            |
-                                                      |             v            v
-                                                      |         aggregate    error_analysis
-                                                      |             |          |        \
-                                                      |             v     (something    (nothing retryable /
-                                                      |         pr_publish  retryable)    round cap hit)
-                                                      |             |          |              |
-                                                      |             v          |              v
-                                                      |            END         |             END
-                                                      \_______________________/
-                                                  (rejoins the SAME editor fanout)
+START -> comprehension --(budget gone)--------------------------------> budget_abort -> END
+              |
+              v
+          synthesis --route_to_editors--> editor (parallel Send fanout)
+              |   \__(budget gone)__> budget_abort            |
+              |                                                v
+              |                                       budget_reconcile
+              |                                         |            \
+              |                       (more tasks now ready)        (nothing left ready)
+              |                                         |                  |
+              |                           (budget gone) |                  v
+              |                          -> budget_abort|             sandbox_test
+              |                                         |              |          \
+              |                                         |           (passed)   (failed / error)
+              |                                         |              |            |
+              |                                         |              v            v
+              |                                         |          aggregate    error_analysis
+              |                                         |              |          |        \
+              |                                         |              v   (something      (nothing retryable /
+              |                                         |          pr_publish  retryable)    round cap hit)
+              |                                         |              |          |              |
+              |                                         |              v          |              v
+              |                                         |             END         |             END
+              |                                         \_______________________/
+              |                                  (rejoins the SAME editor fanout)
+              \__(nothing ready)__> sandbox_test
 ```
 
 `route_to_editors` is the conditional router on three edges (synthesis,
 `budget_reconcile`, `error_analysis`), so multi-wave dependency scheduling
-and the retry loop are one mechanism, not two.
+and the retry loop are one mechanism, not two. It is also the single
+budget gate: see Step 8.
 
-## Status: Step 7 of 10 — FastAPI + Celery async API layer
+## Status: Step 8 of 10 — Budget guard + observability
 
-114 tests pass. Every external collaborator (LLM, Docker, GitHub, Postgres)
+127 tests pass. Every external collaborator (LLM, Docker, GitHub, Postgres)
 is exercised through a fake, so the suite needs no API key, daemon, or token.
 
 ### Steps 1–2: Scaffolding, state schema, comprehension
@@ -120,8 +126,8 @@ as a mysteriously incomplete migration.
   dependency, specifically so the actual security posture is unit-
   testable without a Docker daemon.
 - **Sandbox test node** (`app/graph/nodes/sandbox_test.py`) — applies
-  all current effective diffs to the target workspace and runs the full
-  suite; routes to `AGGREGATING` on pass, `ERROR_ANALYSIS` on anything
+  every diff in `editor_results` to the target workspace and runs the
+  full suite; routes to `AGGREGATING` on pass, `ERROR_ANALYSIS` on anything
   else.
 
 ### Step 4: Synthesis, editors, and the first real compiled graph
@@ -142,7 +148,7 @@ as a mysteriously incomplete migration.
 - **Editor node** (`app/graph/nodes/editor.py`) — the actual code-
   generation LLM call, invoked once per parallel `Send()` branch.
   Handles retries (`RETRYING` → `NEEDS_HUMAN` after `max_retries`) and
-  a soft budget pre-check.
+  keeps a last-line budget check (the real gate is in the router, Step 8).
 - **Dependency-aware fanout routing** (`app/graph/routing.py`) —
   dispatches every task whose dependencies have already `SUCCEEDED` as
   one parallel `Send()` batch. (Originally single-wave; Step 5 made it
@@ -207,32 +213,14 @@ The system becomes self-correcting, not just a linear pipeline.
 
 ### Step 6: Diff aggregation and GitHub PR generation
 
-Includes three integrity fixes to earlier steps that only surfaced once
-"what exactly ships in the PR?" was asked in earnest:
+One integrity fix to earlier steps, only partly landed:
 
-- **Fix 1 — superseded attempts.** `editor_results` is append-only, so
-  after a retry it holds multiple attempts for the same task. Both the
-  sandbox and the PR now derive their file set from ONE shared module,
-  `app/graph/diffs.py` (`effective_diffs` / `effective_results` /
-  `stale_paths`) — latest attempt per `SUCCEEDED` task, nothing else.
-  `stale_paths` also feeds `remove_paths` (`app/sandbox/workspace.py`)
-  so a retry that stops emitting a helper file doesn't leave a stale
-  copy the tests still see.
-- **Fix 2 — undeclared output paths.** The editor node enforces a file
-  contract: generated output must be exactly the task's declared
-  `target_files`, no more, no fewer (`_contract_violation` in
-  `app/graph/nodes/editor.py`). Without this, nothing stopped an editor
-  from quietly rewriting the target repo's own test files to make a
-  suite "pass." A violation is treated like a failed generation —
-  retried with the violation itself as feedback. This caught a real bug
-  in the test fixtures: the fake code generator was parsing target file
-  paths out of the *entire* prompt instead of just the file-list
-  section, and picked up a spurious path from `::`-delimited IR unit ids.
-- **Fix 3 — the retry loop now uses its own analysis.**
-  `ErrorAnalysis.suggested_fix_instructions` was computed but never fed
-  anywhere. Added `MigrationTask.retry_feedback`, set by `error_analysis`
-  and read by the editor's retry prompt — a retry is now a directed fix
-  attempt, not a second blind guess.
+- **Superseded attempts.** `editor_results` is append-only, so after a
+  retry it holds multiple attempts for the same task. The PR side derives
+  its file set from ONE shared module, `app/graph/diffs.py`
+  (`effective_diffs` / `effective_results` / `stale_paths`) — latest
+  attempt per `SUCCEEDED` task, nothing else — used by `aggregate` and
+  `pr_publish`. **The sandbox does not use it yet**: see "Known gaps".
 
 New in this step:
 
@@ -325,6 +313,53 @@ declared in `GraphState`.**
   this should be smoke-tested against a real Postgres instance before
   relying on it in production.
 
+### Step 8: Budget guard + observability
+
+**Budget guard.** Three independent ceilings, any one of which exhausts the
+budget (`BudgetState.exhausted_reason()` says which): cost (`max_usd`), LLM
+call count (`max_llm_calls`), and wall clock (`max_wall_clock_seconds`,
+measured from `started_at`).
+
+- **One central gate.** Every editor dispatch — first wave, dependency
+  waves, retries — passes through `route_to_editors`. If work remains but
+  the budget is exhausted, the run goes to the new `budget_abort` node. If
+  nothing remains, the run proceeds to testing even when the last dollar
+  was just spent.
+- **Wave capping.** Parallel waves are sized by the largest single call
+  cost seen so far (`BudgetState.affordable_calls`), so branches can't
+  collectively overshoot the ceiling; leftovers are picked up by the next
+  wave. The worst-case overshoot is one call. It is not an exact ceiling,
+  since a call can't be capped before it runs — setting `max_tokens` on the
+  Anthropic clients would tighten it further.
+- **`budget_abort`** (`app/graph/nodes/budget_abort.py`) marks unfinished
+  tasks `SKIPPED`, records why in `error_log`, sets `ABORTED_BUDGET` and
+  ends the run. A partial migration is never tested or published.
+  Comprehension running out of budget now ends the run through the same
+  node instead of falling through to synthesis.
+- **Per-run limits.** `max_usd`, `max_llm_calls` and `max_wall_clock_seconds`
+  are API request fields, defaulting from `DEFAULT_MAX_USD_PER_RUN`,
+  `DEFAULT_MAX_LLM_CALLS_PER_RUN` and `DEFAULT_MAX_WALL_CLOCK_SECONDS`. The
+  status endpoint reports calls made and the limits alongside spend.
+
+**Observability.** Two independent layers (`app/core/observability.py`):
+
+- **Structured JSON logs, always on.** `observed_node` wraps every graph
+  node and emits one `node_finished` (or `node_failed`) line with `run_id`,
+  `node`, `task_id`, `duration_ms`, `phase`, `cost_delta_usd` and a budget
+  snapshot (`budget_spent_usd`, `budget_remaining_usd`, `llm_calls_made`).
+  Logging is configured once in the API lifespan and the Celery task.
+  Filter one run with, e.g., `jq 'select(.run_id=="<id>")'`.
+- **LangSmith tracing, opt-in, no node code.** Set `LANGSMITH_TRACING=true`,
+  `LANGSMITH_API_KEY` and `LANGSMITH_PROJECT`. The worker passes the thread
+  id, tags (`springboot->fastapi`) and metadata (`run_id`, stacks,
+  `max_usd`) so a trace can be found by run.
+
+Tests: `tests/test_budget_guard.py` covers each ceiling, wave capping, the
+gate, the abort node, and two full-graph aborts (budget runs out
+mid-migration; wall clock expired before comprehension) that assert the
+sandbox and PR are never reached. `tests/test_observability.py` covers the
+log lines, failure re-raise and trace metadata.
+
 ## Roadmap
 
 1. ~~Scaffolding + state schema~~ ✅
@@ -334,9 +369,34 @@ declared in `GraphState`.**
 5. ~~Test runner + error-analyzer retry loop~~ ✅
 6. ~~Diff aggregation + GitHub PR generation~~ ✅
 7. ~~FastAPI + Celery async API layer~~ ✅
-8. Budget guard + observability wiring
+8. ~~Budget guard + observability wiring~~ ✅
 9. Human-in-the-loop approval via `interrupt()`
 10. Deployment (Dockerfile, docker-compose, CI)
+
+## Known gaps
+
+Stated plainly rather than glossed over. Items 1 to 3 were described in
+earlier versions of this README as done; they are not in the code.
+
+1. **Sandbox applies superseded attempts.** `sandbox_test` applies every
+   diff in `editor_results` instead of `effective_diffs`, and there is no
+   `remove_paths` cleanup. After a retry, a file the retry stopped emitting
+   can linger in the workspace and be seen by the tests, so the sandbox and
+   the PR can disagree about "the files".
+2. **No editor file contract.** Nothing enforces that generated output is
+   exactly the task's declared `target_files`, so an editor could add or
+   rewrite undeclared files (including the target repo's own tests).
+3. **Error-analysis feedback is not used.** `ErrorAnalysis.suggested_fix_instructions`
+   is computed but never fed into the retry prompt (`MigrationTask` has no
+   `retry_feedback` field), so a retry is a blind second attempt.
+4. **Comprehension undercounts LLM calls.** It records N extraction calls as
+   one, so `max_llm_calls` is looser than it looks.
+5. **Nodes mutate `BudgetState` in place.** Safe today, but risky for
+   checkpoint history and for Step 9's `interrupt()` resume.
+6. **Wall clock keeps running while a run waits for human approval.** Step 9
+   should count active time only.
+7. **`AsyncPostgresSaver` round-trip is unverified** (see Step 7): tests use
+   the in-memory `MemorySaver`.
 
 ## Running the tests
 
@@ -363,6 +423,14 @@ zero GitHub token, and zero Postgres instance. The one exception is
 `tests/test_repo_prep.py`, which does real (tiny, shallow) `git clone`
 calls against a public GitHub repo — everything else is either a pure
 function or exercised through a fake.
+
+## Configuration
+
+Copy `.env.example` to `.env`. Per-run budget defaults
+(`DEFAULT_MAX_USD_PER_RUN`, `DEFAULT_MAX_LLM_CALLS_PER_RUN`,
+`DEFAULT_MAX_WALL_CLOCK_SECONDS`) can be overridden per request. Tracing
+needs `LANGSMITH_TRACING=true` plus the key and project; the JSON logs need
+no configuration.
 
 ## Why a TypedDict for `GraphState` and not pure Pydantic?
 
