@@ -69,14 +69,40 @@ async def test_no_target_repo_configured_ends_done_without_publishing():
 
 
 @pytest.mark.asyncio
-async def test_approval_required_stops_without_publishing():
+async def test_approval_required_but_not_recorded_refuses_to_publish():
+    """Fail closed: the router should never get here, but if a wiring mistake does, no unapproved PR opens."""
     publisher = FakePublisher()
     node = build_pr_publish_node(publisher)
     state = _base_state(config=_config(require_human_approval_before_pr=True))
 
     update = await node(state)
 
-    assert update["phase"] == MigrationPhase.AWAITING_APPROVAL
+    assert update["phase"] == MigrationPhase.FAILED
+    assert any("approval" in e for e in update["error_log"])
+    assert len(publisher.calls) == 0
+
+
+@pytest.mark.asyncio
+async def test_approval_required_and_recorded_publishes():
+    publisher = FakePublisher()
+    node = build_pr_publish_node(publisher)
+    state = _base_state(config=_config(require_human_approval_before_pr=True), approval_status="approved")
+
+    update = await node(state)
+
+    assert update["phase"] == MigrationPhase.DONE
+    assert len(publisher.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_rejected_decision_never_publishes_even_if_the_node_is_reached():
+    publisher = FakePublisher()
+    node = build_pr_publish_node(publisher)
+    state = _base_state(config=_config(require_human_approval_before_pr=True), approval_status="rejected")
+
+    update = await node(state)
+
+    assert update["phase"] == MigrationPhase.FAILED
     assert len(publisher.calls) == 0
 
 

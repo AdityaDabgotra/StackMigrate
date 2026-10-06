@@ -113,6 +113,9 @@ class GraphState(TypedDict, total=False):
     pr_url: str | None
     pr_branch_name: str | None
 
+    # ---- human approval (single-writer: only approval_gate sets it) ----
+    approval_status: str | None   # "approved" | "rejected" | None (no decision / not required)
+
     # ---- cross-cutting ----
     budget: BudgetState
     retry_round: int             # global retry-round counter, separate from per-task retry_count

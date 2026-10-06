@@ -1,20 +1,15 @@
 """
 PR publish node.
 
-Three outcomes, in order of precedence:
-  1. No `github_target_repo` configured -> nothing to publish to. Ends at
-     DONE with the diffs/draft still in state (a caller can still read
-     `pr_draft` and `aggregated_diff_paths` — useful for a dry run, or for
-     a caller that wants to publish somewhere other than GitHub).
-  2. `require_human_approval_before_pr` is True -> stop at AWAITING_APPROVAL
-     without calling the publisher. Real interrupt/resume wiring
-     (LangGraph's `interrupt()`, pausing this exact point for a human to
-     confirm) is Step 9's job; for now this node simply doesn't publish,
-     and `publish_approved_pr` below is the function a caller (e.g. the
-     Step 7 API layer, once a human approves) invokes afterward — kept
-     as a standalone function specifically so it's the same code path
-     this node itself uses in case 3, not a second implementation.
-  3. Approval not required -> publish immediately.
+Reached only after `aggregate` (and, when approval is required, after the
+human approval gate — see app/graph/nodes/approval.py). Outcomes:
+  1. No `pr_draft` -> aggregate failed upstream; leave its FAILED state alone.
+  2. No `github_target_repo` configured -> nothing to publish to. Ends at
+     DONE with the draft still in state (a dry run).
+  3. Approval required but no recorded approval -> REFUSE (FAILED). The
+     router should make this unreachable; this check exists so a wiring
+     mistake can never open a PR nobody approved.
+  4. Otherwise publish.
 """
 
 from __future__ import annotations
@@ -22,6 +17,7 @@ from __future__ import annotations
 import asyncio
 from typing import Protocol
 
+from app.graph.routing import needs_human_approval
 from app.graph.state import MigrationPhase, PRDraft
 from app.vcs.interface import PRPublisher, PublishedPR
 
@@ -32,9 +28,8 @@ class Publisher(Protocol):
 
 async def publish_approved_pr(state: dict, publisher: PRPublisher) -> dict:
     """
-    Actually calls the publisher. Standalone so both the "approval not
-    required" path in `pr_publish_node` and a future external caller
-    (once a human approves a paused run) go through the exact same logic.
+    Actually calls the publisher. Kept standalone so the publish logic is
+    testable on its own, separate from the approval policy in the node.
     """
     config = state["config"]
     draft: PRDraft = state["pr_draft"]
@@ -90,8 +85,11 @@ def build_pr_publish_node(publisher: PRPublisher):
                 "error_log": ["No github_target_repo configured — migration complete, PR not opened."],
             }
 
-        if config.get("require_human_approval_before_pr", True):
-            return {"phase": MigrationPhase.AWAITING_APPROVAL}
+        if needs_human_approval(state) and state.get("approval_status") != "approved":
+            return {
+                "phase": MigrationPhase.FAILED,
+                "error_log": ["Refusing to publish: human approval is required but was not recorded."],
+            }
 
         return await publish_approved_pr(state, publisher)
 

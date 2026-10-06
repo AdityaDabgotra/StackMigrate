@@ -49,3 +49,18 @@ def test_run_config_carries_thread_id_and_searchable_trace_metadata():
     assert cfg["configurable"] == {"thread_id": "run-9"}
     assert "springboot->fastapi" in cfg["tags"]
     assert cfg["metadata"]["run_id"] == "run-9"
+
+
+@pytest.mark.asyncio
+async def test_an_interrupt_is_logged_as_a_pause_not_a_failure(caplog):
+    from langgraph.errors import GraphInterrupt
+
+    async def pausing(state):
+        raise GraphInterrupt()
+
+    with caplog.at_level(logging.INFO, logger="stackmigrate"):
+        with pytest.raises(GraphInterrupt):
+            await observed_node("approval_gate", pausing)({"config": {"run_id": "r"}})
+
+    messages = [r.getMessage() for r in caplog.records]
+    assert "node_interrupted" in messages and "node_failed" not in messages

@@ -23,6 +23,8 @@ import logging
 import time
 from typing import Any, Awaitable, Callable
 
+from langgraph.errors import GraphBubbleUp
+
 logger = logging.getLogger("stackmigrate")
 
 _RESERVED = set(logging.LogRecord("", 0, "", 0, "", (), None).__dict__) | {"message", "asctime"}
@@ -80,6 +82,13 @@ def observed_node(name: str, fn: Callable[[dict], Awaitable[dict]]) -> Callable[
         started = time.monotonic()
         try:
             update = await fn(state)
+        except GraphBubbleUp:
+            # interrupt() (and other control-flow signals) travel as exceptions;
+            # that's a pause, not a failure. Log it as such and let it propagate.
+            logger.info(
+                "node_interrupted", extra={**base, "duration_ms": round((time.monotonic() - started) * 1000)}
+            )
+            raise
         except Exception:
             logger.exception(
                 "node_failed", extra={**base, "duration_ms": round((time.monotonic() - started) * 1000)}

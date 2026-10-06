@@ -27,6 +27,11 @@ from app.graph.state import MigrationPhase, MigrationTask, TaskStatus, TestOutco
 NO_READY_TASKS = "no_ready_tasks"
 BUDGET_EXHAUSTED = "budget_exhausted"
 CONTINUE = "continue"
+APPROVAL_REQUIRED = "approval_required"
+PUBLISH = "publish"
+FINISH = "finish"
+APPROVED = "approved"
+REJECTED = "rejected"
 SANDBOX_PASSED = "sandbox_passed"
 SANDBOX_NEEDS_ANALYSIS = "sandbox_needs_analysis"
 
@@ -99,3 +104,24 @@ def route_after_sandbox(state: dict) -> str:
 def route_after_comprehension(state: dict) -> str:
     """A budget abort inside comprehension must end the run, not fall through to synthesis/sandbox."""
     return BUDGET_EXHAUSTED if state.get("phase") == MigrationPhase.ABORTED_BUDGET else CONTINUE
+
+
+def needs_human_approval(state: dict) -> bool:
+    """
+    The ONE definition of "this run must be approved by a human before a PR
+    is opened". Used by the router (to send the run to the approval gate) and
+    by `pr_publish` (to refuse to publish without a recorded approval), so the
+    two can never disagree. Nothing to approve if no repo is configured.
+    """
+    config = state.get("config") or {}
+    return bool(config.get("github_target_repo")) and config.get("require_human_approval_before_pr", True)
+
+
+def route_after_aggregate(state: dict) -> str:
+    if state.get("pr_draft") is None:
+        return FINISH  # aggregate failed upstream and already set FAILED + error_log
+    return APPROVAL_REQUIRED if needs_human_approval(state) else PUBLISH
+
+
+def route_after_approval(state: dict) -> str:
+    return APPROVED if state.get("approval_status") == "approved" else REJECTED

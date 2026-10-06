@@ -54,7 +54,7 @@ def _request_payload(**overrides) -> dict:
 def test_submit_migration_returns_202_and_a_run_id_and_hands_off_to_the_submitter():
     submitter = FakeTaskSubmitter()
     graph = build_graph(checkpointer=MemorySaver())
-    app = create_app(graph=graph, task_submitter=submitter, pr_publisher=FakePRPublisher())
+    app = create_app(graph=graph, task_submitter=submitter)
     client = TestClient(app)
 
     response = client.post("/migrations", json=_request_payload())
@@ -71,7 +71,7 @@ def test_submit_migration_returns_202_and_a_run_id_and_hands_off_to_the_submitte
 def test_submit_migration_rejects_invalid_payload():
     submitter = FakeTaskSubmitter()
     graph = build_graph(checkpointer=MemorySaver())
-    app = create_app(graph=graph, task_submitter=submitter, pr_publisher=FakePRPublisher())
+    app = create_app(graph=graph, task_submitter=submitter)
     client = TestClient(app)
 
     response = client.post("/migrations", json={"source_repo_url": "x"})  # missing required fields
@@ -82,7 +82,7 @@ def test_submit_migration_rejects_invalid_payload():
 
 def test_status_for_unknown_run_returns_404():
     graph = build_graph(checkpointer=MemorySaver())
-    app = create_app(graph=graph, task_submitter=FakeTaskSubmitter(), pr_publisher=FakePRPublisher())
+    app = create_app(graph=graph, task_submitter=FakeTaskSubmitter())
     client = TestClient(app)
 
     response = client.get("/migrations/run-does-not-exist")
@@ -118,7 +118,7 @@ async def test_status_reflects_real_graph_state_after_a_completed_run():
             config={"configurable": {"thread_id": "run-status-test"}},
         )
 
-        app = create_app(graph=graph, task_submitter=FakeTaskSubmitter(), pr_publisher=FakePRPublisher())
+        app = create_app(graph=graph, task_submitter=FakeTaskSubmitter())
         client = TestClient(app)
 
         response = client.get("/migrations/run-status-test")
@@ -136,11 +136,13 @@ async def test_approve_publishes_pr_when_run_is_awaiting_approval():
     with tempfile.TemporaryDirectory() as source_root, tempfile.TemporaryDirectory() as target_root:
         _write_spring_repo(source_root)
         saver = MemorySaver()
+        publisher = FakePRPublisher()
         graph = build_graph(
             checkpointer=saver,
             extractor=FakeExtractor(),
             code_generator=FakeCodeGenerator(),
             sandbox_runner=FakeSandboxRunner(outcome=TestOutcome.PASSED),
+            pr_publisher=publisher,
         )
 
         config = {
@@ -160,13 +162,14 @@ async def test_approve_publishes_pr_when_run_is_awaiting_approval():
             config={"configurable": {"thread_id": "run-approve-test"}},
         )
 
-        publisher = FakePRPublisher()
-        app = create_app(graph=graph, task_submitter=FakeTaskSubmitter(), pr_publisher=publisher)
+        app = create_app(graph=graph, task_submitter=FakeTaskSubmitter())
         client = TestClient(app)
 
-        # confirm it's actually sitting at AWAITING_APPROVAL before we approve it
+        # the run is genuinely PAUSED at the gate (nothing published yet) and exposes what to review
         pre = client.get("/migrations/run-approve-test").json()
         assert pre["phase"] == MigrationPhase.AWAITING_APPROVAL.value
+        assert pre["pending_approval"]["files"] and pre["pending_approval"]["title"]
+        assert publisher.calls == []
 
         response = client.post("/migrations/run-approve-test/approve")
 
@@ -176,15 +179,17 @@ async def test_approve_publishes_pr_when_run_is_awaiting_approval():
         assert body["pr_url"] == "https://github.com/acme/orders-api/pull/7"
         assert len(publisher.calls) == 1
 
-        # status now reflects the publish too — proves aupdate_state actually persisted it
+        # status reflects the resumed run, and the pending-approval block is gone
         after = client.get("/migrations/run-approve-test").json()
         assert after["phase"] == "done"
+        assert after["approval_status"] == "approved"
+        assert after["pending_approval"] is None
         assert after["pr_url"] == "https://github.com/acme/orders-api/pull/7"
 
 
 def test_approve_on_unknown_run_returns_404():
     graph = build_graph(checkpointer=MemorySaver())
-    app = create_app(graph=graph, task_submitter=FakeTaskSubmitter(), pr_publisher=FakePRPublisher())
+    app = create_app(graph=graph, task_submitter=FakeTaskSubmitter())
     client = TestClient(app)
 
     response = client.post("/migrations/run-does-not-exist/approve")
@@ -196,11 +201,13 @@ async def test_approve_on_run_not_awaiting_approval_returns_409():
     with tempfile.TemporaryDirectory() as source_root, tempfile.TemporaryDirectory() as target_root:
         _write_spring_repo(source_root)
         saver = MemorySaver()
+        publisher = FakePRPublisher()
         graph = build_graph(
             checkpointer=saver,
             extractor=FakeExtractor(),
             code_generator=FakeCodeGenerator(),
             sandbox_runner=FakeSandboxRunner(outcome=TestOutcome.PASSED),
+            pr_publisher=publisher,
         )
         config = {
             "run_id": "run-not-awaiting",
@@ -219,8 +226,7 @@ async def test_approve_on_run_not_awaiting_approval_returns_409():
             config={"configurable": {"thread_id": "run-not-awaiting"}},
         )
 
-        publisher = FakePRPublisher()
-        app = create_app(graph=graph, task_submitter=FakeTaskSubmitter(), pr_publisher=publisher)
+        app = create_app(graph=graph, task_submitter=FakeTaskSubmitter())
         client = TestClient(app)
 
         response = client.post("/migrations/run-not-awaiting/approve")

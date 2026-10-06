@@ -27,7 +27,6 @@ from app.api.task_submitter import CeleryTaskSubmitter
 from app.core.observability import configure_logging
 from app.db.checkpointer import get_checkpointer
 from app.graph.build import build_graph
-from app.vcs.github_publisher import GitHubPRPublisher
 
 
 @asynccontextmanager
@@ -42,6 +41,5 @@ async def lifespan(fastapi_app: FastAPI):
 
 app = create_app(
     task_submitter=CeleryTaskSubmitter(),
-    pr_publisher=GitHubPRPublisher(),
     lifespan=lifespan,
 )

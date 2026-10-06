@@ -42,6 +42,7 @@ from app.core.llm import ExtractionClient
 from app.core.observability import observed_node
 from app.graph.nodes.aggregate import build_aggregate_node
 from app.graph.nodes.pr_publish import build_pr_publish_node
+from app.graph.nodes.approval import build_approval_gate_node, build_request_approval_node
 from app.graph.nodes.budget_abort import build_budget_abort_node
 from app.graph.nodes.budget_reconcile import build_budget_reconcile_node
 from app.graph.nodes.comprehension import Extractor, build_comprehension_node
@@ -50,11 +51,18 @@ from app.graph.nodes.error_analysis import ErrorAnalyzer, build_error_analysis_n
 from app.graph.nodes.sandbox_test import build_sandbox_test_node
 from app.graph.nodes.synthesis import build_synthesis_node
 from app.graph.routing import (
+    APPROVAL_REQUIRED,
+    APPROVED,
+    FINISH,
+    PUBLISH,
+    REJECTED,
     BUDGET_EXHAUSTED,
     CONTINUE,
     NO_READY_TASKS,
     SANDBOX_NEEDS_ANALYSIS,
     SANDBOX_PASSED,
+    route_after_aggregate,
+    route_after_approval,
     route_after_comprehension,
     route_after_sandbox,
     route_to_editors,
@@ -99,6 +107,8 @@ def build_graph(
     graph.add_node("error_analysis", observed_node("error_analysis", build_error_analysis_node(error_analyzer)))
     graph.add_node("aggregate", observed_node("aggregate", build_aggregate_node()))
     graph.add_node("pr_publish", observed_node("pr_publish", build_pr_publish_node(pr_publisher)))
+    graph.add_node("request_approval", observed_node("request_approval", build_request_approval_node()))
+    graph.add_node("approval_gate", observed_node("approval_gate", build_approval_gate_node()))
     graph.add_node("budget_abort", observed_node("budget_abort", build_budget_abort_node()))
 
     graph.add_edge(START, "comprehension")
@@ -134,7 +144,13 @@ def build_graph(
         "error_analysis", route_to_editors, {NO_READY_TASKS: END, BUDGET_EXHAUSTED: "budget_abort"}
     )
 
-    graph.add_edge("aggregate", "pr_publish")
+    graph.add_conditional_edges(
+        "aggregate",
+        route_after_aggregate,
+        {APPROVAL_REQUIRED: "request_approval", PUBLISH: "pr_publish", FINISH: END},
+    )
+    graph.add_edge("request_approval", "approval_gate")
+    graph.add_conditional_edges("approval_gate", route_after_approval, {APPROVED: "pr_publish", REJECTED: END})
     graph.add_edge("pr_publish", END)
     graph.add_edge("budget_abort", END)
 

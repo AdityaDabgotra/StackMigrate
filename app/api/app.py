@@ -7,8 +7,9 @@ instance — same reasoning as `build_graph()`: production wiring
 pass fakes, and there is exactly one code path either way rather than
 test-only conditionals sprinkled through route handlers.
 
-Status/approve read and write state via the compiled graph's own
-`aget_state`/`aupdate_state` — no separate "runs" table. The graph's
+Status reads state via the compiled graph's own `aget_state`, and
+approve/reject RESUME the paused graph (`Command(resume=...)`, see
+app/graph/nodes/approval.py) — no separate "runs" table. The graph's
 checkpointer (Postgres in production, see app/db/checkpointer.py) is
 already the durable, queryable record of every run; duplicating it
 would just be a second source of truth that could drift from the first.
@@ -29,23 +30,24 @@ production use — see the README's noted gap for this step.
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from typing import Any, Callable
 
 from fastapi import FastAPI, HTTPException, Request
+from langgraph.types import Command
 
 from app.api.schemas import (
     ApproveResponse,
+    DecisionRequest,
     MigrationRequest,
     MigrationStatusResponse,
     MigrationSubmitResponse,
+    PendingApproval,
     PRDraftSummary,
     TaskSummary,
 )
 from app.api.task_submitter import TaskSubmitter
-from app.graph.nodes.pr_publish import publish_approved_pr
-from app.graph.state import MigrationPhase
-from app.vcs.interface import PRPublisher
 
 
 def _field(obj, name: str, default=None):
@@ -65,7 +67,15 @@ def _enum_value(x, default=None):
     return getattr(x, "value", x)  # already a plain string if this is a dict-shaped round-trip
 
 
-def _state_to_status_response(run_id: str, values: dict) -> MigrationStatusResponse:
+APPROVAL_NODE = "approval_gate"
+
+
+def _is_awaiting_approval(snapshot) -> bool:
+    """The authoritative signal that a run is paused for a human: the graph's next node IS the gate."""
+    return APPROVAL_NODE in (snapshot.next or ())
+
+
+def _state_to_status_response(run_id: str, values: dict, *, awaiting_approval: bool = False) -> MigrationStatusResponse:
     tasks = values.get("tasks", []) or []
     task_summaries = [
         TaskSummary(
@@ -85,6 +95,17 @@ def _state_to_status_response(run_id: str, values: dict) -> MigrationStatusRespo
         else None
     )
 
+    pending = (
+        PendingApproval(
+            title=_field(pr_draft_obj, "title"),
+            body=_field(pr_draft_obj, "body"),
+            branch_name=_field(pr_draft_obj, "branch_name"),
+            files=list(values.get("aggregated_diff_paths") or []),
+        )
+        if awaiting_approval and pr_draft_obj
+        else None
+    )
+
     full_suite = values.get("full_suite_result")
 
     return MigrationStatusResponse(
@@ -99,6 +120,9 @@ def _state_to_status_response(run_id: str, values: dict) -> MigrationStatusRespo
         full_suite_outcome=_enum_value(_field(full_suite, "outcome")),
         pr_draft=pr_draft,
         pr_url=values.get("pr_url"),
+        approval_status=values.get("approval_status"),
+        human_feedback=values.get("human_feedback"),
+        pending_approval=pending,
         error_log_tail=(values.get("error_log") or [])[-20:],
     )
 
@@ -107,7 +131,6 @@ def create_app(
     *,
     graph: Any = None,
     task_submitter: TaskSubmitter,
-    pr_publisher: PRPublisher,
     lifespan: Callable[[FastAPI], Any] | None = None,
 ) -> FastAPI:
     """
@@ -136,6 +159,9 @@ def create_app(
     app = FastAPI(title="stackmigrate", lifespan=lifespan)
     if graph is not None:
         app.state.graph = graph
+    # One lock per run: a double-clicked approve must not resume (and publish) twice.
+    # In-process only — with several API replicas, serialize on the run in the DB instead (Step 10).
+    app.state.run_locks = {}
 
     @app.post("/migrations", response_model=MigrationSubmitResponse, status_code=202)
     async def submit_migration(payload: MigrationRequest) -> MigrationSubmitResponse:
@@ -148,32 +174,37 @@ def create_app(
         snapshot = await request.app.state.graph.aget_state({"configurable": {"thread_id": run_id}})
         if not snapshot.values:
             raise HTTPException(status_code=404, detail=f"No migration run found with id '{run_id}'")
-        return _state_to_status_response(run_id, snapshot.values)
+        return _state_to_status_response(run_id, snapshot.values, awaiting_approval=_is_awaiting_approval(snapshot))
 
-    @app.post("/migrations/{run_id}/approve", response_model=ApproveResponse)
-    async def approve_migration(run_id: str, request: Request) -> ApproveResponse:
+    async def _decide(run_id: str, request: Request, *, approved: bool, feedback: str | None) -> ApproveResponse:
         graph = request.app.state.graph
         thread_config = {"configurable": {"thread_id": run_id}}
-        snapshot = await graph.aget_state(thread_config)
-        if not snapshot.values:
-            raise HTTPException(status_code=404, detail=f"No migration run found with id '{run_id}'")
+        lock = request.app.state.run_locks.setdefault(run_id, asyncio.Lock())
 
-        phase = _enum_value(snapshot.values.get("phase"))
-        if phase != MigrationPhase.AWAITING_APPROVAL.value:
-            raise HTTPException(
-                status_code=409,
-                detail=f"Run '{run_id}' is not awaiting approval (current phase: {phase!r}).",
+        async with lock:
+            # Re-read INSIDE the lock: a concurrent request may have just resumed this run.
+            snapshot = await graph.aget_state(thread_config)
+            if not snapshot.values:
+                raise HTTPException(status_code=404, detail=f"No migration run found with id '{run_id}'")
+            if not _is_awaiting_approval(snapshot):
+                phase = _enum_value(snapshot.values.get("phase"))
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Run '{run_id}' is not awaiting approval (current phase: {phase!r}).",
+                )
+
+            result = await graph.ainvoke(
+                Command(resume={"approved": approved, "feedback": feedback}), thread_config
             )
-        if not snapshot.values.get("pr_draft"):
-            raise HTTPException(status_code=409, detail=f"Run '{run_id}' has no PR draft to publish.")
 
-        result = await publish_approved_pr(snapshot.values, pr_publisher)
-        await graph.aupdate_state(thread_config, result)
+        return ApproveResponse(run_id=run_id, phase=_enum_value(result.get("phase")), pr_url=result.get("pr_url"))
 
-        return ApproveResponse(
-            run_id=run_id,
-            phase=_enum_value(result.get("phase")),
-            pr_url=result.get("pr_url"),
-        )
+    @app.post("/migrations/{run_id}/approve", response_model=ApproveResponse)
+    async def approve_migration(run_id: str, request: Request, body: DecisionRequest | None = None) -> ApproveResponse:
+        return await _decide(run_id, request, approved=True, feedback=body.feedback if body else None)
+
+    @app.post("/migrations/{run_id}/reject", response_model=ApproveResponse)
+    async def reject_migration(run_id: str, request: Request, body: DecisionRequest | None = None) -> ApproveResponse:
+        return await _decide(run_id, request, approved=False, feedback=body.feedback if body else None)
 
     return app

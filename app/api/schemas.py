@@ -47,6 +47,19 @@ class PRDraftSummary(BaseModel):
     branch_name: str
 
 
+class PendingApproval(BaseModel):
+    """What a reviewer needs to decide on a run that is paused at the approval gate."""
+
+    title: str
+    body: str
+    branch_name: str
+    files: list[str]
+
+
+class DecisionRequest(BaseModel):
+    feedback: str | None = Field(default=None, description="Optional note recorded with the decision")
+
+
 class MigrationStatusResponse(BaseModel):
     run_id: str
     phase: str | None
@@ -59,10 +72,15 @@ class MigrationStatusResponse(BaseModel):
     full_suite_outcome: str | None
     pr_draft: PRDraftSummary | None
     pr_url: str | None
+    approval_status: str | None = None
+    human_feedback: str | None = None
+    pending_approval: PendingApproval | None = None
     error_log_tail: list[str]
 
 
 class ApproveResponse(BaseModel):
+    """Result of approving OR rejecting: `phase` is `done`/`failed` after an approval, `rejected` after a rejection."""
+
     run_id: str
     phase: str
     pr_url: str | None

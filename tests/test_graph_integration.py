@@ -313,28 +313,6 @@ async def test_round_cap_terminates_a_perpetually_failing_run_instead_of_looping
 
 
 @pytest.mark.asyncio
-async def test_approval_required_stops_graph_before_publishing():
-    with tempfile.TemporaryDirectory() as source_root, tempfile.TemporaryDirectory() as target_root:
-        _write_spring_repo(source_root)
-        publisher = FakePublisher()
-        graph = build_graph(
-            extractor=FakeExtractor(),
-            code_generator=FakeCodeGenerator(),
-            sandbox_runner=FakeSandboxRunner(outcome=TestOutcome.PASSED),
-            pr_publisher=publisher,
-        )
-        config = _base_config(source_root, target_root)
-        config["github_target_repo"] = "acme/orders-api"
-        config["require_human_approval_before_pr"] = True
-
-        final_state = await graph.ainvoke({"config": config, "budget": BudgetState(max_usd=10.0)})
-
-        assert final_state["phase"] == MigrationPhase.AWAITING_APPROVAL
-        assert final_state["pr_draft"] is not None
-        assert publisher.calls == []  # the gate actually held
-
-
-@pytest.mark.asyncio
 async def test_publishes_pr_with_exactly_the_effective_diffs_when_approval_not_required():
     with tempfile.TemporaryDirectory() as source_root, tempfile.TemporaryDirectory() as target_root:
         _write_spring_repo(source_root)

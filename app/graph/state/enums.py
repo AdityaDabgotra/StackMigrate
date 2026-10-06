@@ -54,6 +54,7 @@ class MigrationPhase(str, Enum):
     AWAITING_APPROVAL = "awaiting_approval"
     PR_GENERATION = "pr_generation"
     DONE = "done"
+    REJECTED = "rejected"  # a human reviewed the PR draft and declined it; terminal, nothing was published
     FAILED = "failed"
     ABORTED_BUDGET = "aborted_budget"
     NEEDS_HUMAN = "needs_human"  # run stopped itself and is waiting on a person — not necessarily a hard failure
