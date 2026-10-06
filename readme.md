@@ -25,7 +25,7 @@ The pipeline is split into two phases that never share code paths:
 by `observed_node` (structured logging, see Step 8).
 
 ```
-START -> comprehension --(budget gone)--------------------------------> budget_abort -> END
+START -> comprehension --(budget gone)--------------------------> budget_abort -> END
               |
               v
           synthesis --route_to_editors--> editor (parallel Send fanout)
@@ -42,25 +42,38 @@ START -> comprehension --(budget gone)--------------------------------> budget_a
               |                                         |              |            |
               |                                         |              v            v
               |                                         |          aggregate    error_analysis
-              |                                         |              |          |        \
-              |                                         |              v   (something      (nothing retryable /
-              |                                         |          pr_publish  retryable)    round cap hit)
-              |                                         |              |          |              |
-              |                                         |              v          |              v
-              |                                         |             END         |             END
-              |                                         \_______________________/
-              |                                  (rejoins the SAME editor fanout)
+              |                                         |       (tail, below)     |        \
+              |                                         |                  (something      (nothing retryable /
+              |                                         |                   retryable)      round cap hit)
+              |                                         |                       |               |
+              |                                         \_______________________/               v
+              |                                  (rejoins the SAME editor fanout)              END
               \__(nothing ready)__> sandbox_test
+```
+
+The tail after `aggregate` (Step 9):
+
+```
+aggregate --(aggregate failed: no draft)-----------------------------> END
+    |
+    +--(no repo, or approval not required)--------------------------> pr_publish -> END
+    |
+    +--(approval required)--> request_approval -> approval_gate
+                                  (phase = AWAITING_APPROVAL)   (graph PAUSES here: interrupt())
+                                                                      |
+                                                       approve -------+------- reject
+                                                          |                       |
+                                                      pr_publish -> END         END  (phase = REJECTED)
 ```
 
 `route_to_editors` is the conditional router on three edges (synthesis,
 `budget_reconcile`, `error_analysis`), so multi-wave dependency scheduling
 and the retry loop are one mechanism, not two. It is also the single
-budget gate: see Step 8.
+budget gate: see Step 8. The approval pause is described in Step 9.
 
-## Status: Step 8 of 10 — Budget guard + observability
+## Status: Step 9 of 10 — Human-in-the-loop approval
 
-127 tests pass. Every external collaborator (LLM, Docker, GitHub, Postgres)
+140 tests pass. Every external collaborator (LLM, Docker, GitHub, Postgres)
 is exercised through a fake, so the suite needs no API key, daemon, or token.
 
 ### Steps 1–2: Scaffolding, state schema, comprehension
@@ -239,23 +252,19 @@ New in this step:
   pattern as every other external SDK in this project; constructing
   `GitHubPRPublisher()` never touches the network or requires a token —
   that only happens inside `publish()`.
-- **Approval gating** (`app/graph/nodes/pr_publish.py`) — honors
-  `require_human_approval_before_pr`: stops at `AWAITING_APPROVAL` with
-  the draft ready to inspect, without calling the publisher. The real
-  pause/resume (`interrupt()`) is Step 9's job; for now this is a clean
-  terminal state, and `publish_approved_pr` is a standalone function so
-  the API layer reuses the exact same publish path rather than a second
-  implementation that could drift from it.
-- **A bug caught by reasoning through the wiring**: the fixed
-  `aggregate -> pr_publish` edge always runs `pr_publish`, but
-  `aggregate` can fail (empty diffs, unpublishable path) without
-  producing a `pr_draft`. Fixed with an explicit guard that leaves
-  `aggregate`'s own `FAILED` state untouched.
-- **Graph-level tests for the publish path** in
-  `tests/test_graph_integration.py`: one proves a PR is published (via
-  a fake publisher) with exactly the effective diffs and nothing else,
-  the other proves the approval gate stops the run — publisher never
-  called — while still leaving a draft behind.
+- **Approval gating.** `require_human_approval_before_pr` (in the schema
+  since Step 1) is honored by `pr_publish` and, since Step 9, by a real
+  pause/resume gate in front of it. `publish_approved_pr` is a standalone
+  function so the publish logic is testable on its own.
+- **A bug caught by reasoning through the wiring**: `aggregate` can fail
+  (empty diffs, unpublishable path) without producing a `pr_draft`, which
+  would have crashed `pr_publish` on a missing key. `pr_publish` keeps an
+  explicit guard that leaves `aggregate`'s own `FAILED` state untouched,
+  and (Step 9) the router sends a draft-less run straight to `END`.
+- **Graph-level test for the publish path**
+  (`tests/test_graph_integration.py`): proves a PR is published, via a fake
+  publisher, with exactly the effective diffs and nothing else. The
+  approval-gate tests live in `tests/test_approval_flow.py` (Step 9).
 
 **Bug found and fixed while wiring Step 6 into the compiled graph:**
 `aggregate` and `pr_publish` were not registered in `build_graph()`, a
@@ -277,18 +286,16 @@ declared in `GraphState`.**
   against a tiny public repo (`tests/test_repo_prep.py`) — deliberately
   not faked, since the whole point of this module is "did we get the
   real clone semantics right," which a mock can't verify.
-- **No separate "runs" database.** Status and approval read/write
-  through the compiled graph's own `aget_state`/`aupdate_state` against
-  its existing checkpointer — LangGraph's checkpoint store already IS
-  the durable, queryable record of every run; a second store would just
-  be a second source of truth that could drift from the first.
-- **`app/api/app.py`** — `create_app()` factory with three routes:
-  `POST /migrations` (submit, hands off via a `TaskSubmitter` Protocol —
-  Celery in production, a recording fake in tests), `GET /migrations/{id}`
-  (404 if the thread never existed), `POST /migrations/{id}/approve`
-  (404 if unknown, 409 if not `AWAITING_APPROVAL` or no draft, otherwise
-  calls `publish_approved_pr` — reused, not reimplemented — then
-  `aupdate_state` to persist the result).
+- **No separate "runs" database.** Status reads and approve/reject resumes
+  go through the compiled graph's own `aget_state` / `ainvoke` against its
+  existing checkpointer — LangGraph's checkpoint store already IS the
+  durable, queryable record of every run; a second store would just be a
+  second source of truth that could drift from the first.
+- **`app/api/app.py`** — `create_app()` factory: `POST /migrations`
+  (submit, hands off via a `TaskSubmitter` Protocol — Celery in production,
+  a recording fake in tests), `GET /migrations/{id}` (404 if the thread
+  never existed), and — as of Step 9 — `POST /migrations/{id}/approve` and
+  `/reject`, which resume a paused run (see Step 9).
 - **`app/worker/tasks.py`** — the real Celery task: repo prep, real
   graph, real Postgres checkpointer, one run per LangGraph thread
   (`thread_id == run_id`).
@@ -360,6 +367,48 @@ mid-migration; wall clock expired before comprehension) that assert the
 sandbox and PR are never reached. `tests/test_observability.py` covers the
 log lines, failure re-raise and trace metadata.
 
+### Step 9: Human-in-the-loop approval via `interrupt()`
+
+When a run has a `github_target_repo` and `require_human_approval_before_pr`
+(default true), the graph now genuinely PAUSES before opening a PR and
+resumes only on a human decision. It's a checkpointed LangGraph
+`interrupt()`, so the run survives process restarts (with the Postgres
+checkpointer) and the Celery worker is free the moment it pauses.
+
+- **Two nodes around one interrupt** (`app/graph/nodes/approval.py`).
+  `request_approval` only sets `phase=AWAITING_APPROVAL` so the paused
+  checkpoint reads correctly; `approval_gate` calls `interrupt()` with a
+  reviewable payload (title, body, branch, file list). A node's own state
+  update is not committed when it interrupts, and on resume the node re-runs
+  from its first line — so nothing before `interrupt()` may have side
+  effects, which is why the bookkeeping lives in its own node.
+- **Fails closed.** Only a resume of exactly `{"approved": true}` approves.
+  A missing key, `"true"`, `1`, or `null` is a rejection.
+- **One definition of "needs approval"** (`needs_human_approval` in
+  `app/graph/routing.py`) is shared by the router and by `pr_publish`.
+  `pr_publish` now refuses to publish (phase `FAILED`) if approval is
+  required but `approval_status != "approved"`, so a future wiring mistake
+  can't open an unapproved PR.
+- **API.** `POST /migrations/{id}/approve` and `/reject` (optional body
+  `{"feedback": "..."}`) resume the graph with `Command(resume=...)`.
+  404 for an unknown run, 409 if the run isn't paused at the gate.
+  `GET /migrations/{id}` reports `pending_approval` (title, body, branch,
+  files) while paused, then `approval_status` and `human_feedback` after.
+  A per-run lock plus a re-read inside it means a double-clicked approve
+  publishes once (tested concurrently). The API no longer takes a publisher:
+  the publisher lives in the graph, so there is one publish path.
+- **New phase `REJECTED`:** terminal, nothing published, feedback recorded in
+  `human_feedback` and `error_log`.
+- **A bug caught while wiring this:** `observed_node` (Step 8) caught every
+  `Exception`, and LangGraph's `interrupt()` travels as an exception, so each
+  approval pause would have been logged as a failed node. Interrupts are now
+  logged as `node_interrupted` and re-raised.
+- **Tests** (`tests/test_approval_flow.py`): pauses with nothing published;
+  approve publishes exactly once with the effective files; reject publishes
+  nothing; five malformed resume values all fail closed; no pause when
+  approval isn't required or no repo is set; reject-then-409 over HTTP; a
+  concurrent double-approve returns 200 and 409 and publishes once.
+
 ## Roadmap
 
 1. ~~Scaffolding + state schema~~ ✅
@@ -370,7 +419,7 @@ log lines, failure re-raise and trace metadata.
 6. ~~Diff aggregation + GitHub PR generation~~ ✅
 7. ~~FastAPI + Celery async API layer~~ ✅
 8. ~~Budget guard + observability wiring~~ ✅
-9. Human-in-the-loop approval via `interrupt()`
+9. ~~Human-in-the-loop approval via `interrupt()`~~ ✅
 10. Deployment (Dockerfile, docker-compose, CI)
 
 ## Known gaps
@@ -393,10 +442,20 @@ earlier versions of this README as done; they are not in the code.
    one, so `max_llm_calls` is looser than it looks.
 5. **Nodes mutate `BudgetState` in place.** Safe today, but risky for
    checkpoint history and for Step 9's `interrupt()` resume.
-6. **Wall clock keeps running while a run waits for human approval.** Step 9
-   should count active time only.
+6. **Wall clock keeps running while a run waits for approval.** It only
+   matters if a decision can lead back to editors; today a rejection
+   terminates the run, so it is dormant.
 7. **`AsyncPostgresSaver` round-trip is unverified** (see Step 7): tests use
-   the in-memory `MemorySaver`.
+   the in-memory `MemorySaver`. Step 9 adds a pause/resume through the
+   checkpointer, which makes this check more important.
+8. **No authentication on `/approve` and `/reject`.** Anyone who can reach the
+   API and knows a run id can approve a PR. Must be fixed before deployment
+   (Step 10).
+9. **The approval lock is in-process.** With several API replicas, two
+   instances could both resume a run; serialize on the run in the database.
+10. **Reviewers see the PR body and file paths, not file contents or a diff.**
+11. **Reject is terminal.** There is no "request changes" loop that feeds
+    `human_feedback` back to the editors, and no expiry for runs left waiting.
 
 ## Running the tests
 
