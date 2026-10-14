@@ -23,6 +23,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from app.api.app import create_app
+from app.api.auth import load_api_key
 from app.api.task_submitter import CeleryTaskSubmitter
 from app.core.observability import configure_logging
 from app.db.checkpointer import get_checkpointer
@@ -41,5 +42,6 @@ async def lifespan(fastapi_app: FastAPI):
 
 app = create_app(
     task_submitter=CeleryTaskSubmitter(),
+    api_key=load_api_key(),  # raises at startup if unset, unless STACKMIGRATE_ALLOW_NO_AUTH=1
     lifespan=lifespan,
 )

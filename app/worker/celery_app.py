@@ -9,7 +9,11 @@ from celery import Celery
 
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
 
-celery_app = Celery("stackmigrate", broker=REDIS_URL, backend=REDIS_URL)
+# `include` is what makes a worker started with `celery -A app.worker.celery_app worker`
+# register `stackmigrate.run_migration`. The API only ever *sends* the task by name
+# (app/api/task_submitter.py), so without this the worker would reject every job
+# as an unregistered task.
+celery_app = Celery("stackmigrate", broker=REDIS_URL, backend=REDIS_URL, include=["app.worker.tasks"])
 celery_app.conf.update(
     task_serializer="json",
     result_serializer="json",

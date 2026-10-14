@@ -56,8 +56,11 @@ class GitRepoPreparer:
     subdirectory per run so concurrent runs never collide.
     """
 
-    def __init__(self, base_dir: str = "/tmp/stackmigrate-runs") -> None:
-        self._base_dir = base_dir
+    def __init__(self, base_dir: str | None = None) -> None:
+        # Docker deployments set STACKMIGRATE_WORK_DIR to a directory that exists at the SAME path
+        # on the host: sandbox containers are siblings started via the host daemon, which resolves
+        # workspace bind-mount paths on the host, not inside the worker container.
+        self._base_dir = base_dir or os.environ.get("STACKMIGRATE_WORK_DIR", "/tmp/stackmigrate-runs")
 
     async def prepare_source(self, *, repo_url: str, ref: str, run_id: str) -> str:
         dest = os.path.join(self._base_dir, run_id, "source")

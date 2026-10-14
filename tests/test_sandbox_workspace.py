@@ -63,3 +63,39 @@ def test_apply_diffs_is_all_or_nothing_on_bad_batch():
             apply_diffs(tmp, diffs)
 
         assert not os.path.exists(os.path.join(tmp, "good.py"))
+
+
+def test_remove_paths_deletes_files_ignores_missing_and_never_removes_directories():
+    import os
+    import tempfile
+
+    from app.sandbox.workspace import remove_paths
+
+    with tempfile.TemporaryDirectory() as root:
+        os.makedirs(os.path.join(root, "pkg"))
+        with open(os.path.join(root, "pkg", "old.py"), "w") as f:
+            f.write("x")
+
+        removed = remove_paths(root, ["pkg/old.py", "pkg/never_existed.py", "pkg"])
+
+        assert removed == ["pkg/old.py"]
+        assert os.path.isdir(os.path.join(root, "pkg"))
+
+
+def test_remove_paths_is_all_or_nothing_on_an_unsafe_path():
+    import os
+    import tempfile
+
+    import pytest
+
+    from app.sandbox.workspace import UnsafeDiffPathError, remove_paths
+
+    with tempfile.TemporaryDirectory() as root:
+        keep = os.path.join(root, "keep.py")
+        with open(keep, "w") as f:
+            f.write("x")
+
+        with pytest.raises(UnsafeDiffPathError):
+            remove_paths(root, ["keep.py", "../../etc/passwd"])
+
+        assert os.path.exists(keep)  # nothing was deleted before the bad path was caught

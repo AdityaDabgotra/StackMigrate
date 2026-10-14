@@ -1,12 +1,11 @@
 """
 Sandbox test-run node.
 
-Step 3 scope: runs the FULL test suite against whatever diffs are
-currently in `editor_results`. Step 5 (test runner + error analyzer
-retry loop) will extend this to scoped per-task runs and wire in the
-retry/replan branching — deliberately not built here, to keep this
-step's surface area to "the sandbox infrastructure works and is wired
-into the graph once," provably.
+Runs the FULL test suite against the *effective* generated files: the
+latest attempt of every SUCCEEDED task (`app/graph/diffs.py`), the same set
+`aggregate` puts in the PR. Files an earlier attempt wrote that the effective
+set no longer contains are deleted first, so the tested workspace matches what
+ships and a retry can't leave a stale copy that quietly satisfies the tests.
 
 `DockerSandboxRunner.run` is a blocking call (the Docker SDK is sync),
 so it's offloaded to a thread executor to avoid blocking the event loop
@@ -20,14 +19,16 @@ import asyncio
 from app.adapters.target_registry import get_target_test_adapter
 from app.graph.state import MigrationPhase, TestOutcome
 from app.sandbox.interface import SandboxRunner
-from app.sandbox.workspace import UnsafeDiffPathError, apply_diffs
+from app.graph.diffs import effective_diffs, stale_paths
+from app.sandbox.workspace import UnsafeDiffPathError, apply_diffs, remove_paths
 
 
 def build_sandbox_test_node(sandbox_runner: SandboxRunner):
     async def sandbox_test_node(state: dict) -> dict:
         config = state["config"]
         editor_results = state.get("editor_results", [])
-        diffs = [diff for result in editor_results for diff in result.diffs]
+        tasks = state.get("tasks", [])
+        diffs = effective_diffs(editor_results, tasks)
 
         if not diffs:
             return {
@@ -36,6 +37,7 @@ def build_sandbox_test_node(sandbox_runner: SandboxRunner):
             }
 
         try:
+            remove_paths(config["target_workspace_path"], stale_paths(editor_results, tasks))
             apply_diffs(config["target_workspace_path"], diffs)
         except UnsafeDiffPathError as exc:
             # This is a hard stop, not a retryable test failure — an editor

@@ -1,0 +1,89 @@
+# Local/single-host deployment: Postgres (checkpoints) + Redis (queue) + API + Celery worker.
+#
+#   cp .env.example .env     # fill in ANTHROPIC_API_KEY, GITHUB_TOKEN, POSTGRES_PASSWORD, STACKMIGRATE_API_KEY
+#   docker compose up --build
+#
+# Secrets are required, not defaulted: compose refuses to start with them unset or empty.
+
+x-app-env: &app-env
+  ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:?set ANTHROPIC_API_KEY in .env}
+  GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+  STACKMIGRATE_API_KEY: ${STACKMIGRATE_API_KEY:?set STACKMIGRATE_API_KEY in .env}
+  # Inside the compose network the services are reachable by name, not localhost.
+  MIGRATION_DB_URL: postgresql://stackmigrate:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/stackmigrate
+  REDIS_URL: redis://redis:6379/0
+  DEFAULT_MAX_USD_PER_RUN: ${DEFAULT_MAX_USD_PER_RUN:-5.00}
+  DEFAULT_MAX_LLM_CALLS_PER_RUN: ${DEFAULT_MAX_LLM_CALLS_PER_RUN:-500}
+  DEFAULT_MAX_WALL_CLOCK_SECONDS: ${DEFAULT_MAX_WALL_CLOCK_SECONDS:-3600}
+  LANGSMITH_TRACING: ${LANGSMITH_TRACING:-false}
+  LANGSMITH_API_KEY: ${LANGSMITH_API_KEY:-}
+  LANGSMITH_PROJECT: ${LANGSMITH_PROJECT:-stackmigrate}
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: stackmigrate
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: stackmigrate
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U stackmigrate -d stackmigrate"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+    # No `ports:` on purpose: only the API is reachable from outside the compose network.
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  api:
+    build: .
+    environment: *app-env
+    ports:
+      - "127.0.0.1:8000:8000"   # loopback only; put a TLS-terminating reverse proxy in front to expose it
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+
+  worker:
+    build: .
+    command: ["celery", "-A", "app.worker.celery_app", "worker", "--loglevel=INFO", "--concurrency=2"]
+    environment:
+      <<: *app-env
+      STACKMIGRATE_WORK_DIR: ${STACKMIGRATE_WORK_DIR:-/var/lib/stackmigrate/work}
+      C_FORCE_ROOT: "true"
+    # SECURITY: the worker starts sandbox containers through the host's Docker daemon, so it needs the
+    # socket, and access to that socket is equivalent to root on the host. It runs as root for the same
+    # reason (socket ownership varies by platform). Treat this container as fully trusted, keep it off
+    # shared hosts, and see the README's "Known gaps" for the hardening options.
+    user: root
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Sandbox containers are SIBLINGS started by the host daemon, which resolves bind-mount paths on
+      # the HOST. So the work directory must exist at the same absolute path on the host and in here.
+      - ${STACKMIGRATE_WORK_DIR:-/var/lib/stackmigrate/work}:${STACKMIGRATE_WORK_DIR:-/var/lib/stackmigrate/work}
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    healthcheck:
+      disable: true
+    restart: unless-stopped
+
+volumes:
+  pgdata:

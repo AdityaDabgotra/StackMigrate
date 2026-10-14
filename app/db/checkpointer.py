@@ -23,9 +23,10 @@ from __future__ import annotations
 
 import os
 from contextlib import asynccontextmanager
-from typing import AsyncIterator
+from typing import TYPE_CHECKING, AsyncIterator
 
-from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+if TYPE_CHECKING:
+    from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
 
 def _get_conn_string() -> str:
@@ -38,6 +39,30 @@ def _get_conn_string() -> str:
     return conn_string
 
 
+def state_serde():
+    """
+    Serializer that explicitly allows every model/enum in `app.graph.state` to be
+    reconstructed from a checkpoint. Without this, LangGraph logs "Deserializing
+    unregistered type ... will be blocked in a future version" for each of them: a
+    routine dependency upgrade would then stop in-flight runs (including ones paused
+    for human approval) from loading. Derived from the package's `__all__`, so a new
+    state model is covered automatically.
+    """
+    from enum import Enum
+
+    from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
+    from pydantic import BaseModel
+
+    import app.graph.state as state_pkg
+
+    allowed = [
+        (obj.__module__, obj.__qualname__)
+        for obj in (getattr(state_pkg, name) for name in state_pkg.__all__)
+        if isinstance(obj, type) and issubclass(obj, (BaseModel, Enum))
+    ]
+    return JsonPlusSerializer(allowed_msgpack_modules=allowed)
+
+
 @asynccontextmanager
 async def get_checkpointer() -> AsyncIterator[AsyncPostgresSaver]:
     """
@@ -46,8 +71,10 @@ async def get_checkpointer() -> AsyncIterator[AsyncPostgresSaver]:
     they don't exist) via the `ensure_schema` function below, not on every
     request.
     """
+    from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver  # lazy: only needed when a real DB is used
+
     conn_string = _get_conn_string()
-    async with AsyncPostgresSaver.from_conn_string(conn_string) as checkpointer:
+    async with AsyncPostgresSaver.from_conn_string(conn_string, serde=state_serde()) as checkpointer:
         yield checkpointer
 
 
