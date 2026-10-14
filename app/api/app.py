@@ -34,9 +34,10 @@ import asyncio
 import uuid
 from typing import Any, Callable
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from langgraph.types import Command
 
+from app.api.auth import make_api_key_dependency
 from app.api.schemas import (
     ApproveResponse,
     DecisionRequest,
@@ -131,6 +132,7 @@ def create_app(
     *,
     graph: Any = None,
     task_submitter: TaskSubmitter,
+    api_key: str | None = None,
     lifespan: Callable[[FastAPI], Any] | None = None,
 ) -> FastAPI:
     """
@@ -157,19 +159,24 @@ def create_app(
     actually needs.
     """
     app = FastAPI(title="stackmigrate", lifespan=lifespan)
+    auth = [Depends(make_api_key_dependency(api_key))]  # every /migrations route; /healthz stays open
+
+    @app.get("/healthz")
+    async def healthz() -> dict[str, str]:
+        return {"status": "ok"}
     if graph is not None:
         app.state.graph = graph
     # One lock per run: a double-clicked approve must not resume (and publish) twice.
     # In-process only — with several API replicas, serialize on the run in the DB instead (Step 10).
     app.state.run_locks = {}
 
-    @app.post("/migrations", response_model=MigrationSubmitResponse, status_code=202)
+    @app.post("/migrations", response_model=MigrationSubmitResponse, status_code=202, dependencies=auth)
     async def submit_migration(payload: MigrationRequest) -> MigrationSubmitResponse:
         run_id = f"run-{uuid.uuid4().hex[:12]}"
         task_submitter.submit(run_id=run_id, request=payload)
         return MigrationSubmitResponse(run_id=run_id, status="queued")
 
-    @app.get("/migrations/{run_id}", response_model=MigrationStatusResponse)
+    @app.get("/migrations/{run_id}", response_model=MigrationStatusResponse, dependencies=auth)
     async def get_migration_status(run_id: str, request: Request) -> MigrationStatusResponse:
         snapshot = await request.app.state.graph.aget_state({"configurable": {"thread_id": run_id}})
         if not snapshot.values:
@@ -199,11 +206,11 @@ def create_app(
 
         return ApproveResponse(run_id=run_id, phase=_enum_value(result.get("phase")), pr_url=result.get("pr_url"))
 
-    @app.post("/migrations/{run_id}/approve", response_model=ApproveResponse)
+    @app.post("/migrations/{run_id}/approve", response_model=ApproveResponse, dependencies=auth)
     async def approve_migration(run_id: str, request: Request, body: DecisionRequest | None = None) -> ApproveResponse:
         return await _decide(run_id, request, approved=True, feedback=body.feedback if body else None)
 
-    @app.post("/migrations/{run_id}/reject", response_model=ApproveResponse)
+    @app.post("/migrations/{run_id}/reject", response_model=ApproveResponse, dependencies=auth)
     async def reject_migration(run_id: str, request: Request, body: DecisionRequest | None = None) -> ApproveResponse:
         return await _decide(run_id, request, approved=False, feedback=body.feedback if body else None)
 

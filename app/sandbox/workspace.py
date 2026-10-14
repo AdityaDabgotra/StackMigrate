@@ -38,6 +38,22 @@ def _resolve_safe_path(workspace_root: str, relative_path: str) -> str:
     return candidate
 
 
+def remove_paths(workspace_root: str, paths: list[str]) -> list[str]:
+    """
+    Deletes files a superseded attempt left behind. Same safety posture as
+    `apply_diffs`: every path goes through `_resolve_safe_path` first, and a
+    single unsafe path raises before anything is deleted. Missing files are
+    fine, and directories are never removed (only regular files).
+    """
+    resolved = [(p, _resolve_safe_path(workspace_root, p)) for p in paths]
+    removed: list[str] = []
+    for rel, full in resolved:
+        if os.path.isfile(full) or os.path.islink(full):
+            os.remove(full)
+            removed.append(rel)
+    return removed
+
+
 def apply_diffs(workspace_root: str, diffs: list[FileDiff]) -> list[str]:
     """
     Writes each diff's content to workspace_root/<diff.path>, creating

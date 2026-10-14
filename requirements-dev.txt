@@ -1,0 +1,7 @@
+# Everything needed to run the tests and lint. The Docker image installs only requirements.txt.
+-r requirements.txt
+
+pytest>=8.3.0
+pytest-asyncio>=0.24.0
+httpx>=0.27.0   # FastAPI's TestClient and the concurrency test use it
+ruff>=0.7.0

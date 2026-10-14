@@ -9,7 +9,7 @@ from langgraph.checkpoint.memory import MemorySaver
 from app.api.app import create_app
 from app.api.schemas import MigrationRequest
 from app.graph.build import build_graph
-from app.graph.state import BudgetState, MigrationPhase, TaskStatus, TestOutcome
+from app.graph.state import BudgetState, MigrationPhase, TestOutcome
 from app.vcs.interface import PublishedPR
 from tests.test_comprehension_node import FakeExtractor, _write_spring_repo
 from tests.test_graph_integration import FakeCodeGenerator, FakeSandboxRunner

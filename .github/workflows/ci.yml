@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: requirements*.txt
+      - run: pip install -r requirements-dev.txt
+      - name: Lint
+        run: ruff check app tests
+      - name: Tests
+        # No API keys, Docker daemon or Postgres needed: every external collaborator is faked.
+        # tests/test_repo_prep.py does make a real (tiny) git clone over the network.
+        run: pytest tests -q
+        env:
+          PYTHONPATH: .
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the image
+        run: docker build -t stackmigrate:ci .
+      - name: The image imports and registers the Celery task
+        run: >
+          docker run --rm -e REDIS_URL=redis://unused:6379/0 stackmigrate:ci
+          python -c "from app.worker.celery_app import celery_app; celery_app.loader.import_default_modules();
+          assert 'stackmigrate.run_migration' in celery_app.tasks"
+      - name: The API refuses to boot without an API key
+        run: |
+          if docker run --rm -e MIGRATION_DB_URL=x stackmigrate:ci python -c "import app.main" 2>/dev/null; then
+            echo "app.main imported without STACKMIGRATE_API_KEY - auth is not failing closed"; exit 1
+          fi
+      - name: docker-compose.yml is valid
+        run: docker compose config -q
+        env:
+          ANTHROPIC_API_KEY: ci
+          POSTGRES_PASSWORD: ci
+          STACKMIGRATE_API_KEY: ci

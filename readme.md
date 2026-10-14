@@ -71,9 +71,11 @@ aggregate --(aggregate failed: no draft)-----------------------------> END
 and the retry loop are one mechanism, not two. It is also the single
 budget gate: see Step 8. The approval pause is described in Step 9.
 
-## Status: Step 9 of 10 — Human-in-the-loop approval
+## Status: All 10 steps built — deployment packaging done
 
-140 tests pass. Every external collaborator (LLM, Docker, GitHub, Postgres)
+157 tests pass. Not yet verified: the Docker image build, `docker compose up`
+and the CI workflow were never run (no Docker daemon was available where they
+were written). See Step 10 for exactly what was and wasn't exercised. Every external collaborator (LLM, Docker, GitHub, Postgres)
 is exercised through a fake, so the suite needs no API key, daemon, or token.
 
 ### Steps 1–2: Scaffolding, state schema, comprehension
@@ -139,8 +141,9 @@ as a mysteriously incomplete migration.
   dependency, specifically so the actual security posture is unit-
   testable without a Docker daemon.
 - **Sandbox test node** (`app/graph/nodes/sandbox_test.py`) — applies
-  every diff in `editor_results` to the target workspace and runs the
-  full suite; routes to `AGGREGATING` on pass, `ERROR_ANALYSIS` on anything
+  the effective generated files (latest attempt per `SUCCEEDED` task,
+  deleting any a retry stopped emitting) to the target workspace and runs
+  the full suite; routes to `AGGREGATING` on pass, `ERROR_ANALYSIS` on anything
   else.
 
 ### Step 4: Synthesis, editors, and the first real compiled graph
@@ -311,14 +314,13 @@ declared in `GraphState`.**
   `AsyncPostgresSaver` at module level, so anything importing it
   required the Postgres extra installed. Fixed with a lazy import, like
   every other external SDK in this project.
-- **Stated gap, not glossed over**: this environment has no Postgres to
-  test against, so `AsyncPostgresSaver`'s round-trip of our custom
-  Pydantic model fields (`BudgetState`, `MigrationTask`, etc.) through
-  real serialization is unverified — tests use LangGraph's in-memory
-  `MemorySaver`. `app/api/app.py`'s status mapper defends against the
-  round-trip producing plain dicts instead of the original objects, but
-  this should be smoke-tested against a real Postgres instance before
-  relying on it in production.
+- **Postgres round-trip: verified in Step 10.** The original gap (only
+  `MemorySaver` was tested) was closed by running a real Postgres: a run
+  paused at the approval gate in one process, and a second process read its
+  status, approved it, and resumed it, with the custom Pydantic state
+  reconstructed correctly. That exercise also found the serializer-allowlist
+  problem described in Step 10.
+
 
 ### Step 8: Budget guard + observability
 
@@ -409,6 +411,69 @@ checkpointer) and the Celery worker is free the moment it pauses.
   approval isn't required or no repo is set; reject-then-409 over HTTP; a
   concurrent double-approve returns 200 and 409 and publishes once.
 
+### Step 10: Deployment (Dockerfile, docker-compose, CI) and hardening
+
+Packaging:
+
+- **`Dockerfile`** — one image, two roles. Python 3.12-slim plus `git`
+  (GitPython shells out to it); installs only `requirements.txt`; the API
+  runs as an unprivileged user.
+- **`docker-compose.yml`** — Postgres (checkpoints), Redis (queue), `api` and
+  `worker`. Secrets are *required*: compose refuses to start if
+  `ANTHROPIC_API_KEY`, `POSTGRES_PASSWORD` or `STACKMIGRATE_API_KEY` is unset.
+  Postgres and Redis publish no ports; the API binds to `127.0.0.1` only.
+- **`.github/workflows/ci.yml`** — Python 3.12 and 3.13: lint, then the full
+  suite. A separate job builds the image, checks it registers the Celery
+  task, checks the API refuses to boot without a key, and validates the
+  compose file.
+- **`requirements.txt` split** into runtime (`requirements.txt`) and test/lint
+  (`requirements-dev.txt`). `httpx`, which the tests need, was missing from
+  the old file. Lint is `ruff.toml` with correctness rules only (`E4,E7,E9,F`).
+
+Bugs found while making it deployable:
+
+- **The Celery worker would have rejected every job.** The API sends the task
+  by name, but `celery_app` never imported `app.worker.tasks`, so a worker
+  started with `celery -A app.worker.celery_app worker` had no such task
+  registered. Fixed with `include=[...]`; tested.
+- **No authentication on the API**, including `/approve`, which publishes
+  code to a repository. All `/migrations` routes now require an `X-API-Key`
+  header (`STACKMIGRATE_API_KEY`, constant-time comparison). Production
+  startup *fails closed*: the app refuses to boot without a key unless
+  `STACKMIGRATE_ALLOW_NO_AUTH=1` is set explicitly. `/healthz` stays open for
+  probes.
+- **The sandbox tested stale files** (the old "Known gap 1"). It now applies
+  the effective set and deletes files an earlier attempt wrote that a retry no
+  longer emits (`remove_paths`, same path-safety rules as `apply_diffs`), so
+  the tested workspace matches what the PR contains.
+- **Checkpoint deserialization would have broken on a LangGraph upgrade.**
+  Against real Postgres, LangGraph warned that every state model was an
+  "unregistered type" that "will be blocked in a future version"; with
+  unpinned dependencies, an upgrade could stop in-flight runs, including ones
+  paused for approval. `state_serde()` now allow-lists every model and enum
+  exported by `app.graph.state`, derived from `__all__`. Tested by a full
+  pause/resume in strict mode.
+- **`app/db/checkpointer.py` imported the Postgres SDK at module level**,
+  contrary to what this README said. Now genuinely lazy.
+- **Work directory is configurable** (`STACKMIGRATE_WORK_DIR`). Sandbox
+  containers are siblings started by the host's Docker daemon, which resolves
+  bind-mount paths on the host, so the directory must exist at the same
+  absolute path on the host and inside the worker.
+
+What was verified, and what wasn't:
+
+- **Verified, on Linux without Docker:** a real Postgres and Redis; the real
+  API (uvicorn) and a real Celery worker as separate processes; the worker
+  registers and receives a job submitted through the API (it then fails at
+  `git clone` of a deliberately bogus URL, as intended); the cross-process
+  pause/approve/resume described above, including with strict checkpoint
+  deserialization; keyless requests get 401.
+- **Not verified:** `docker build`, `docker compose up`, the Docker-socket
+  sandbox path inside the worker container, a real run with live LLM calls
+  and a real GitHub PR, and the CI workflow itself. Expect to fix small
+  things on first contact. The first thing to check is
+  `docker compose up --build`, then submit a real migration of a small repo.
+
 ## Roadmap
 
 1. ~~Scaffolding + state schema~~ ✅
@@ -420,47 +485,52 @@ checkpointer) and the Celery worker is free the moment it pauses.
 7. ~~FastAPI + Celery async API layer~~ ✅
 8. ~~Budget guard + observability wiring~~ ✅
 9. ~~Human-in-the-loop approval via `interrupt()`~~ ✅
-10. Deployment (Dockerfile, docker-compose, CI)
+10. ~~Deployment (Dockerfile, docker-compose, CI)~~ ✅
 
 ## Known gaps
 
-Stated plainly rather than glossed over. Items 1 to 3 were described in
-earlier versions of this README as done; they are not in the code.
+Stated plainly rather than glossed over. Items 1 to 3 were once described in
+this README as done; they are not in the code.
 
-1. **Sandbox applies superseded attempts.** `sandbox_test` applies every
-   diff in `editor_results` instead of `effective_diffs`, and there is no
-   `remove_paths` cleanup. After a retry, a file the retry stopped emitting
-   can linger in the workspace and be seen by the tests, so the sandbox and
-   the PR can disagree about "the files".
+1. **A run that fails before the graph starts is invisible.** If repo prep
+   fails (bad URL, no access), no checkpoint is ever written, so
+   `GET /migrations/{id}` returns 404 forever instead of "failed". Seen in
+   the Step 10 smoke test. The worker should record a `FAILED` state.
 2. **No editor file contract.** Nothing enforces that generated output is
    exactly the task's declared `target_files`, so an editor could add or
-   rewrite undeclared files (including the target repo's own tests).
-3. **Error-analysis feedback is not used.** `ErrorAnalysis.suggested_fix_instructions`
-   is computed but never fed into the retry prompt (`MigrationTask` has no
-   `retry_feedback` field), so a retry is a blind second attempt.
+   rewrite undeclared files (including the target repo's own tests). It also
+   means the sandbox's stale-file cleanup could delete a pre-existing target
+   file that an earlier attempt overwrote.
+3. **Error-analysis feedback is not used.**
+   `ErrorAnalysis.suggested_fix_instructions` is computed but never fed into
+   the retry prompt (`MigrationTask` has no `retry_feedback` field), so a
+   retry is a blind second attempt.
 4. **Comprehension undercounts LLM calls.** It records N extraction calls as
    one, so `max_llm_calls` is looser than it looks.
 5. **Nodes mutate `BudgetState` in place.** Safe today, but risky for
-   checkpoint history and for Step 9's `interrupt()` resume.
-6. **Wall clock keeps running while a run waits for approval.** It only
-   matters if a decision can lead back to editors; today a rejection
-   terminates the run, so it is dormant.
-7. **`AsyncPostgresSaver` round-trip is unverified** (see Step 7): tests use
-   the in-memory `MemorySaver`. Step 9 adds a pause/resume through the
-   checkpointer, which makes this check more important.
-8. **No authentication on `/approve` and `/reject`.** Anyone who can reach the
-   API and knows a run id can approve a PR. Must be fixed before deployment
-   (Step 10).
-9. **The approval lock is in-process.** With several API replicas, two
+   checkpoint history.
+6. **Wall clock keeps running while a run waits for approval.** Dormant
+   today: a rejection terminates the run, so nothing dispatches afterwards.
+7. **API security is minimal.** One shared key (no per-user identity, no
+   rotation, no rate limiting), no TLS (put a reverse proxy in front), and no
+   record of *who* approved a PR.
+8. **The approval lock is in-process.** With several API replicas, two
    instances could both resume a run; serialize on the run in the database.
-10. **Reviewers see the PR body and file paths, not file contents or a diff.**
-11. **Reject is terminal.** There is no "request changes" loop that feeds
-    `human_feedback` back to the editors, and no expiry for runs left waiting.
+9. **Reviewers see the PR body and file paths, not file contents or a diff.**
+10. **Reject is terminal.** There is no "request changes" loop feeding
+    `human_feedback` back to the editors, and runs left waiting never expire.
+11. **The worker holds the Docker socket,** which is equivalent to root on the
+    host (compose runs it as root for that reason). Keep it off shared hosts;
+    options are rootless Docker, a remote sandbox host, or a dedicated sandbox
+    service.
+12. **Dependencies are unpinned** (`>=` ranges), so a build today may differ
+    from one next month. Generate a lock file (e.g. `pip-compile`) before
+    relying on reproducible builds.
 
 ## Running the tests
 
 ```bash
-pip install -r requirements.txt
+pip install -r requirements-dev.txt
 PYTHONPATH=. pytest tests/ -v
 ```
 
@@ -481,7 +551,33 @@ respective SDKs (`langchain_anthropic`, `docker`, `github`,
 zero GitHub token, and zero Postgres instance. The one exception is
 `tests/test_repo_prep.py`, which does real (tiny, shallow) `git clone`
 calls against a public GitHub repo — everything else is either a pure
-function or exercised through a fake.
+function or exercised through a fake. Lint: `ruff check app tests`.
+
+## Deployment
+
+```bash
+cp .env.example .env      # then fill in the secrets (see below)
+sudo mkdir -p /var/lib/stackmigrate/work   # or set STACKMIGRATE_WORK_DIR in .env
+docker compose up --build
+```
+
+Required in `.env`: `ANTHROPIC_API_KEY`, `POSTGRES_PASSWORD`,
+`STACKMIGRATE_API_KEY` (generate with
+`python -c "import secrets; print(secrets.token_urlsafe(32))"`), and
+`GITHUB_TOKEN` to publish PRs. The API listens on `127.0.0.1:8000`.
+
+```bash
+curl -H "X-API-Key: $STACKMIGRATE_API_KEY" -H "content-type: application/json" \
+  -d '{"source_repo_url":"https://github.com/org/spring-app.git","source_stack":"springboot","target_stack":"fastapi","scope_description":"migrate the OrderController module only","github_target_repo":"org/orders-api"}' \
+  http://127.0.0.1:8000/migrations
+
+curl -H "X-API-Key: $STACKMIGRATE_API_KEY" http://127.0.0.1:8000/migrations/<run_id>
+# when phase is "awaiting_approval", review `pending_approval`, then:
+curl -X POST -H "X-API-Key: $STACKMIGRATE_API_KEY" http://127.0.0.1:8000/migrations/<run_id>/approve
+```
+
+Read "Known gaps" (especially 7 and 11) before exposing this beyond your own
+machine.
 
 ## Configuration
 
@@ -489,7 +585,9 @@ Copy `.env.example` to `.env`. Per-run budget defaults
 (`DEFAULT_MAX_USD_PER_RUN`, `DEFAULT_MAX_LLM_CALLS_PER_RUN`,
 `DEFAULT_MAX_WALL_CLOCK_SECONDS`) can be overridden per request. Tracing
 needs `LANGSMITH_TRACING=true` plus the key and project; the JSON logs need
-no configuration.
+no configuration. `STACKMIGRATE_API_KEY` is required (the API refuses to
+start without it unless `STACKMIGRATE_ALLOW_NO_AUTH=1`, for local
+development only), and `STACKMIGRATE_WORK_DIR` sets where run checkouts live.
 
 ## Why a TypedDict for `GraphState` and not pure Pydantic?
 

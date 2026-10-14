@@ -10,6 +10,9 @@ from app.graph.state import (
     EditorResult,
     FileDiff,
     MigrationPhase,
+    MigrationTask,
+    TargetFileSpec,
+    TaskStatus,
     TestOutcome,
     TestResult,
 )
@@ -37,6 +40,17 @@ class FakeSandboxRunner:
         )
 
 
+def _task(task_id: str, status: TaskStatus = TaskStatus.SUCCEEDED) -> MigrationTask:
+    return MigrationTask(
+        id=task_id,
+        source_unit_ids=[task_id],
+        target_files=[TargetFileSpec(path="a.py", purpose="x")],
+        depends_on_task_ids=[],
+        synthesis_instructions="x",
+        status=status,
+    )
+
+
 def _base_config(workspace: str) -> dict:
     return {
         "run_id": "test-run",
@@ -60,6 +74,7 @@ async def test_sandbox_node_applies_diffs_and_reports_pass():
 
         state = {
             "config": _base_config(workspace),
+            "tasks": [_task("task::a")],
             "editor_results": [
                 EditorResult(
                     task_id="task::a",
@@ -85,6 +100,7 @@ async def test_sandbox_node_routes_to_error_analysis_on_failure():
 
         state = {
             "config": _base_config(workspace),
+            "tasks": [_task("task::a")],
             "editor_results": [
                 EditorResult(task_id="task::a", diffs=[FileDiff(path="a.py", content="x")])
             ],
@@ -117,6 +133,7 @@ async def test_sandbox_node_refuses_unsafe_diff_path_without_calling_sandbox():
 
         state = {
             "config": _base_config(workspace),
+            "tasks": [_task("task::a")],
             "editor_results": [
                 EditorResult(task_id="task::a", diffs=[FileDiff(path="../../escape.py", content="pwned")])
             ],
@@ -126,3 +143,56 @@ async def test_sandbox_node_refuses_unsafe_diff_path_without_calling_sandbox():
         assert update["phase"] == MigrationPhase.FAILED
         assert any("unsafe" in e.lower() for e in update["error_log"])
         assert len(runner.calls) == 0  # sandbox never invoked for an unsafe batch
+
+
+@pytest.mark.asyncio
+async def test_sandbox_tests_the_effective_set_and_deletes_files_a_retry_stopped_emitting():
+    """The retry rewrote the task WITHOUT its old helper file. That stale copy must not survive to be tested."""
+    with tempfile.TemporaryDirectory() as workspace:
+        runner = FakeSandboxRunner(canned_outcome=TestOutcome.PASSED)
+        node = build_sandbox_test_node(runner)
+
+        # a previous sandbox run left the first attempt's files on disk
+        for rel in ("app/main.py", "app/helper.py"):
+            os.makedirs(os.path.dirname(os.path.join(workspace, rel)), exist_ok=True)
+            with open(os.path.join(workspace, rel), "w") as f:
+                f.write("# attempt 1")
+
+        state = {
+            "config": _base_config(workspace),
+            "tasks": [_task("task::a")],
+            "editor_results": [
+                EditorResult(
+                    task_id="task::a",
+                    diffs=[FileDiff(path="app/main.py", content="# 1"), FileDiff(path="app/helper.py", content="# 1")],
+                ),
+                EditorResult(task_id="task::a", diffs=[FileDiff(path="app/main.py", content="# attempt 2")]),
+            ],
+        }
+
+        await node(state)
+
+        assert not os.path.exists(os.path.join(workspace, "app", "helper.py"))  # stale, removed
+        with open(os.path.join(workspace, "app", "main.py")) as f:
+            assert f.read() == "# attempt 2"  # latest attempt wins
+
+
+@pytest.mark.asyncio
+async def test_sandbox_does_not_apply_code_from_tasks_that_did_not_succeed():
+    with tempfile.TemporaryDirectory() as workspace:
+        runner = FakeSandboxRunner(canned_outcome=TestOutcome.PASSED)
+        node = build_sandbox_test_node(runner)
+
+        state = {
+            "config": _base_config(workspace),
+            "tasks": [_task("task::ok"), _task("task::bad", TaskStatus.NEEDS_HUMAN)],
+            "editor_results": [
+                EditorResult(task_id="task::ok", diffs=[FileDiff(path="ok.py", content="x")]),
+                EditorResult(task_id="task::bad", diffs=[FileDiff(path="bad.py", content="x")]),
+            ],
+        }
+
+        await node(state)
+
+        assert os.path.exists(os.path.join(workspace, "ok.py"))
+        assert not os.path.exists(os.path.join(workspace, "bad.py"))
